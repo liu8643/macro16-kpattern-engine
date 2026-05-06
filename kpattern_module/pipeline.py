@@ -3,6 +3,7 @@ from .sakata_engine import SakataPatternEngine
 from .position_engine import PatternPositionEngine
 from .volume_engine import VolumeConfirmEngine
 from .score_engine import PatternScoreEngine
+from .decision_engine import PatternDecisionEngine
 
 
 class KPatternPipeline:
@@ -17,6 +18,7 @@ class KPatternPipeline:
         self.position = PatternPositionEngine()
         self.volume = VolumeConfirmEngine()
         self.score = PatternScoreEngine()
+        self.decision = PatternDecisionEngine()
 
     def run(self, df):
         """
@@ -37,5 +39,8 @@ class KPatternPipeline:
 
         # 5. 分數與方向
         df = self.score.build(df)
+
+        # 6. 決策層
+        df = self.decision.build(df)
 
         return df
