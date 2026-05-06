@@ -4,6 +4,7 @@ from .position_engine import PatternPositionEngine
 from .volume_engine import VolumeConfirmEngine
 from .score_engine import PatternScoreEngine
 from .decision_engine import PatternDecisionEngine
+from .selector_engine import PatternSelectorEngine
 
 
 class KPatternPipeline:
@@ -19,6 +20,7 @@ class KPatternPipeline:
         self.volume = VolumeConfirmEngine()
         self.score = PatternScoreEngine()
         self.decision = PatternDecisionEngine()
+        self.selector = PatternSelectorEngine()
 
     def run(self, df):
         """
@@ -42,5 +44,8 @@ class KPatternPipeline:
 
         # 6. 決策層
         df = self.decision.build(df)
+
+        # 7. 選股層（TOP20 / TOP5 / 今日可下單）
+        df = self.selector.build(df)
 
         return df
