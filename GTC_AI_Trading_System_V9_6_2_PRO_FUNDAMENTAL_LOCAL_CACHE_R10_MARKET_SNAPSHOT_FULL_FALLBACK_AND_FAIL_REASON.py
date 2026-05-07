@@ -41,6 +41,22 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# Phase 1：KPattern 模組化最小接入點
+# 說明：此段只建立安全呼叫入口，不改變原本 DB / UI / Ranking / Decision Layer 邏輯。
+# 若 GitHub Repo 內已存在 services/kpattern_service.py，會優先使用；
+# 若尚未建立或 import 失敗，會使用 fallback class，避免主程式啟動崩潰。
+try:
+    from services.kpattern_service import KPatternService
+    KPATTERN_SERVICE_IMPORT_STATUS = "external_service_loaded"
+except Exception as _kpattern_import_exc:
+    KPATTERN_SERVICE_IMPORT_STATUS = f"fallback_service_used: {_kpattern_import_exc}"
+
+    class KPatternService:
+        def run(self, df, price_history=None):
+            print("[KPatternService][fallback] called successfully")
+            return df
+
+
 try:
     import yfinance as yf
 except Exception:
@@ -12462,6 +12478,33 @@ class AppUI:
 
 
 
+def run_kpattern_phase1_smoke_test():
+    """Phase 1 最小可跑驗證：確認主程式能呼叫 KPatternService。
+
+    這不是正式型態運算，不會修改任何交易決策、DB、Excel 或 UI 資料。
+    成功標準：console / log 看到 [KPatternService] called successfully 或 fallback 訊息。
+    """
+    try:
+        sample_df = pd.DataFrame()
+        out_df = KPatternService().run(df=sample_df, price_history=None)
+        ok = isinstance(out_df, pd.DataFrame)
+        msg = f"[PHASE1][KPatternService] smoke_test={'ok' if ok else 'unexpected_return'}｜import_status={KPATTERN_SERVICE_IMPORT_STATUS}"
+        print(msg)
+        try:
+            log_info(msg)
+        except Exception:
+            pass
+        return ok
+    except Exception as exc:
+        msg = f"[PHASE1][KPatternService] smoke_test_failed｜{exc}"
+        print(msg)
+        try:
+            log_warning(msg)
+        except Exception:
+            pass
+        return False
+
+
 def bootstrap():
     if BOOTSTRAP_EVENT.is_set():
         db = DBManager(DB_PATH)
@@ -12515,6 +12558,13 @@ def main():
     app = AppUI(root, db)
     app.set_status(init_message)
 
+    # Phase 1：啟動後先做最小接入驗證。
+    # 此測試只驗證 service 呼叫鏈，不改變交易結果。
+    try:
+        run_kpattern_phase1_smoke_test()
+    except Exception as exc:
+        log_warning(f"[PHASE1][KPatternService] smoke test skipped: {exc}")
+
     def _close():
         log_info("application closing")
         db.close()
@@ -12530,4 +12580,5 @@ if __name__ == "__main__":
 
 # V9.5.6 MARGIN_INTEGRATED PATCH MARKER: external_margin + macro_margin_sentiment + DecisionLayer margin_score completed.
 # V9.6.2-R10 MARKET_SNAPSHOT_FULL_FALLBACK_AND_FAIL_REASON MARKER
+# PHASE1 KPATTERN_SERVICE_INTEGRATED MARKER: safe import + smoke test only; no trading logic changed.
 # V9.5.8 DATA_INTEGRITY_PATCH MARKER: market_snapshot proxy blocked; only TWSE MI_INDEX official data can set data_ready=1.
