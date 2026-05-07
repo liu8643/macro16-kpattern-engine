@@ -41,21 +41,60 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-# Phase 1：KPattern 模組化最小接入點
-# 說明：此段只建立安全呼叫入口，不改變原本 DB / UI / Ranking / Decision Layer 邏輯。
-# 若 GitHub Repo 內已存在 services/kpattern_service.py，會優先使用；
-# 若尚未建立或 import 失敗，會使用 fallback class，避免主程式啟動崩潰。
+# Phase 1+：KPattern 模組化安全接入點（FINAL FIX）
+# 說明：
+# 1) 主程式只保留 Hook，不把型態邏輯塞回主程式。
+# 2) 依序支援目前 GitHub 結構：
+#    A. services/kpattern_service.py
+#    B. kpattern_module/kpattern_pipeline.py
+#    C. engines/kpattern_pipeline.py（舊資料夾相容）
+# 3) 若 services 內仍引用舊 engines 路徑，主程式會自動改用 kpattern_module pipeline，
+#    避免因路徑重構造成 KPattern 只跑 fallback。
+# 4) fallback run 支援 **kwargs，避免 context 參數造成 TypeError。
 try:
-    from services.kpattern_service import KPatternService
+    from services.kpattern_service import KPatternService as _ExternalKPatternService
+    KPatternService = _ExternalKPatternService
     KPATTERN_SERVICE_IMPORT_STATUS = "external_service_loaded"
-except Exception as _kpattern_import_exc:
-    KPATTERN_SERVICE_IMPORT_STATUS = f"fallback_service_used: {_kpattern_import_exc}"
+except Exception as _service_import_exc:
+    try:
+        from kpattern_module.kpattern_pipeline import KPatternPipeline as _KPatternPipeline
 
-    class KPatternService:
-        def run(self, df, price_history=None):
-            print("[KPatternService][fallback] called successfully")
-            return df
+        class KPatternService:
+            """主程式內建相容層：直接呼叫 kpattern_module.KPatternPipeline。"""
 
+            def __init__(self):
+                self.pipeline = _KPatternPipeline()
+
+            def run(self, df, price_history=None, **kwargs):
+                return self.pipeline.run(df, price_history_df=price_history, **kwargs)
+
+        KPATTERN_SERVICE_IMPORT_STATUS = f"kpattern_module_pipeline_loaded_after_service_fail: {_service_import_exc}"
+    except Exception as _module_import_exc:
+        try:
+            from engines.kpattern_pipeline import KPatternPipeline as _LegacyKPatternPipeline
+
+            class KPatternService:
+                """舊 engines 資料夾相容層。"""
+
+                def __init__(self):
+                    self.pipeline = _LegacyKPatternPipeline()
+
+                def run(self, df, price_history=None, **kwargs):
+                    return self.pipeline.run(df, price_history_df=price_history, **kwargs)
+
+            KPATTERN_SERVICE_IMPORT_STATUS = f"legacy_engines_pipeline_loaded: service_fail={_service_import_exc}; module_fail={_module_import_exc}"
+        except Exception as _legacy_import_exc:
+            KPATTERN_SERVICE_IMPORT_STATUS = (
+                "fallback_service_used: "
+                f"service_fail={_service_import_exc}; "
+                f"kpattern_module_fail={_module_import_exc}; "
+                f"engines_fail={_legacy_import_exc}"
+            )
+
+            class KPatternService:
+                def run(self, df, price_history=None, **kwargs):
+                    print(f"[KPatternService][fallback] called successfully｜{KPATTERN_SERVICE_IMPORT_STATUS}")
+                    return df
 
 
 # KPattern 固定欄位：主程式只讀這組輸出，後續擴充只改 kpattern_module。
