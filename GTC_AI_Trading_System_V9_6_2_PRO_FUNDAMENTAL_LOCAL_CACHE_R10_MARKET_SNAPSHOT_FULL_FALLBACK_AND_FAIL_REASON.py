@@ -57,6 +57,78 @@ except Exception as _kpattern_import_exc:
             return df
 
 
+
+# KPattern 固定欄位：主程式只讀這組輸出，後續擴充只改 kpattern_module。
+KPATTERN_RANKING_COLUMNS = [
+    "kpattern_code", "kpattern_name", "kpattern_score", "kpattern_signal",
+    "kpattern_trade_bias", "kpattern_trade_advice", "kpattern_reason",
+    "kpattern_position", "kpattern_position_ratio",
+    "kpattern_volume_confirm", "kpattern_volume_ratio", "kpattern_volume_score",
+    "kpattern_risk_flag", "final_trade_score", "kpattern_rank_adjustment",
+]
+
+
+def _kpattern_default_payload() -> dict:
+    return {
+        "kpattern_code": "NEUTRAL",
+        "kpattern_name": "無明確型態",
+        "kpattern_score": 0.0,
+        "kpattern_signal": "NEUTRAL",
+        "kpattern_trade_bias": "NEUTRAL",
+        "kpattern_trade_advice": "觀察",
+        "kpattern_reason": "KPattern 未觸發",
+        "kpattern_position": "資料不足",
+        "kpattern_position_ratio": 0.0,
+        "kpattern_volume_confirm": "中性",
+        "kpattern_volume_ratio": 1.0,
+        "kpattern_volume_score": 0.0,
+        "kpattern_risk_flag": "NO",
+        "final_trade_score": 50.0,
+        "kpattern_rank_adjustment": 0.0,
+    }
+
+
+def _extract_kpattern_payload(hist_df) -> dict:
+    payload = _kpattern_default_payload()
+    try:
+        if hist_df is None or getattr(hist_df, "empty", True):
+            return payload
+        last = hist_df.iloc[-1]
+        for col in KPATTERN_RANKING_COLUMNS:
+            if col in hist_df.columns:
+                payload[col] = last.get(col, payload.get(col))
+    except Exception as exc:
+        try:
+            log_warning(f"[KPattern] payload extract failed: {exc}")
+        except Exception:
+            pass
+    return payload
+
+
+def apply_kpattern_pipeline_safe(df, price_history=None, context: str = ""):
+    """主程式固定 KPattern Hook。
+    只呼叫 Service，不在主程式內寫型態邏輯；失敗時回傳原 df 並補中性欄位。
+    """
+    try:
+        out = KPatternService().run(df=df, price_history=price_history, context=context)
+        if out is None:
+            out = df
+    except Exception as exc:
+        try:
+            log_warning(f"[KPattern] pipeline skipped context={context}: {exc}")
+        except Exception:
+            pass
+        out = df
+    try:
+        defaults = _kpattern_default_payload()
+        for col, default in defaults.items():
+            if col not in out.columns:
+                out[col] = default
+        return out
+    except Exception:
+        return out
+
+
 try:
     import yfinance as yf
 except Exception:
@@ -2533,6 +2605,21 @@ class DBManager:
             ("revenue_eps_score", "revenue_eps_score REAL DEFAULT 50"),
             ("data_quality_flag", "data_quality_flag TEXT"),
             ("source_trace_json", "source_trace_json TEXT"),
+            ("kpattern_code", "kpattern_code TEXT DEFAULT 'NEUTRAL'"),
+            ("kpattern_name", "kpattern_name TEXT DEFAULT ''"),
+            ("kpattern_score", "kpattern_score REAL DEFAULT 0"),
+            ("kpattern_signal", "kpattern_signal TEXT DEFAULT 'NEUTRAL'"),
+            ("kpattern_trade_bias", "kpattern_trade_bias TEXT DEFAULT 'NEUTRAL'"),
+            ("kpattern_trade_advice", "kpattern_trade_advice TEXT DEFAULT ''"),
+            ("kpattern_reason", "kpattern_reason TEXT DEFAULT ''"),
+            ("kpattern_position", "kpattern_position TEXT DEFAULT ''"),
+            ("kpattern_position_ratio", "kpattern_position_ratio REAL DEFAULT 0"),
+            ("kpattern_volume_confirm", "kpattern_volume_confirm TEXT DEFAULT '中性'"),
+            ("kpattern_volume_ratio", "kpattern_volume_ratio REAL DEFAULT 1"),
+            ("kpattern_volume_score", "kpattern_volume_score REAL DEFAULT 0"),
+            ("kpattern_risk_flag", "kpattern_risk_flag TEXT DEFAULT 'NO'"),
+            ("final_trade_score", "final_trade_score REAL DEFAULT 50"),
+            ("kpattern_rank_adjustment", "kpattern_rank_adjustment REAL DEFAULT 0"),
         ]:
             _add("ranking_result", col, ddl)
 
@@ -3404,6 +3491,8 @@ class RankingEngine:
                     progress_cb(idx, total, stock_id, success, 0, skipped, "skip")
                 continue
             hist = DataEngine.attach(hist)
+            hist = apply_kpattern_pipeline_safe(hist, price_history=hist, context=f"ranking:{stock_id}")
+            kpattern_payload = _extract_kpattern_payload(hist)
             score = StrategyEngineV91.score(hist)
             technical_total = float(score.get("total_score", 0) or 0)
             feat = feature_map.get(stock_id, {})
@@ -3411,19 +3500,24 @@ class RankingEngine:
             valuation_score = float(pd.to_numeric(pd.Series([feat.get("revenue_eps_score", 50)]), errors="coerce").fillna(50).iloc[0])
             liquidity_score = float(score.get("volume_score", 0) or 0)
             theme_score = float(score.get("ai_score", 0) or 0)
+            kpattern_adjustment = float(pd.to_numeric(pd.Series([kpattern_payload.get("kpattern_rank_adjustment", 0.0)]), errors="coerce").fillna(0.0).iloc[0])
             final_total = round(
                 technical_total * 0.50 +
                 revenue_eps_score * 0.20 +
                 valuation_score * 0.10 +
                 liquidity_score * 0.10 +
-                theme_score * 0.10,
+                theme_score * 0.10 +
+                kpattern_adjustment,
                 2
             )
+            final_total = max(0.0, min(100.0, final_total))
             score["technical_total_score"] = round(technical_total, 2)
             score["financial_score"] = round(revenue_eps_score, 2)
             score["total_score"] = final_total
             for c in ["eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "source_trace_json"]:
                 score[c] = feat.get(c, np.nan if c in ["eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score"] else "")
+            for c, v in kpattern_payload.items():
+                score[c] = v
             rows.append({
                 "date": today,
                 "stock_id": stock_id,
