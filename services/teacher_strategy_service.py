@@ -10,133 +10,91 @@ except Exception:
 
 
 class TeacherStrategyService:
-    """
-    TeacherStrategyService V2
+    """TeacherStrategyService V4.1 FINAL：批次執行 TeacherStrategyEngine.analyze_row()。
 
-    功能：
-    1. 服務層，不寫老師策略邏輯
-    2. 批次執行 TeacherStrategyEngine.analyze_row()
-    3. 輸出 teacher_df 給主程式 merge 回 ranking_df / trade_plan
-    4. 保證欄位固定，避免 UI / Excel / DB 缺欄位崩潰
+    服務層只負責批次、欄位標準化、型別安全；不寫老師策略邏輯。
     """
 
     TEACHER_COLUMNS = [
-        "stock_id",
-        "stock_name",
-        "teacher_strategy_class",
-        "teacher_final_decision",
-        "teacher_light",
-        "teacher_gate",
-        "position_stage",
-        "position_score",
-        "two_high_fail",
-        "weak_gate",
-        "weak_score",
-        "rotation",
-        "sector_strength_score",
-        "flow_score",
-        "rs_score",
-        "teacher_buy_zone",
-        "teacher_stop_loss",
-        "teacher_target_price",
-        "teacher_reason",
-        "teacher_source",
+        "stock_id", "stock_name",
+        "teacher_strategy_class", "teacher_final_decision", "teacher_light", "teacher_gate",
+        "teacher_trade_allowed", "teacher_ui_bucket", "teacher_priority",
+        "teacher_no_trade_reason", "teacher_block_reason",
+        "position_stage", "position_score",
+        "two_high_fail", "weak_gate", "weak_score",
+        "rotation", "rotation_level", "sector_strength_score",
+        "flow_score", "rs_score",
+        "low_base_type", "low_base_score", "low_base_reason",
+        "teacher_strategy_score", "teacher_rank", "teacher_rank_seed",
+        "teacher_buy_zone", "teacher_stop_loss", "teacher_target_price",
+        "teacher_reason", "teacher_source",
     ]
 
     DEFAULT_ROW = {
-        "stock_id": "",
-        "stock_name": "",
-        "teacher_strategy_class": "未評估",
-        "teacher_final_decision": "WATCH",
-        "teacher_light": "⚫",
-        "teacher_gate": "NE",
-        "position_stage": "未知",
-        "position_score": 0.0,
-        "two_high_fail": False,
-        "weak_gate": "NE",
-        "weak_score": 0.0,
-        "rotation": "未知",
-        "sector_strength_score": 0.0,
-        "flow_score": 0.0,
-        "rs_score": 0.0,
-        "teacher_buy_zone": "",
-        "teacher_stop_loss": "",
-        "teacher_target_price": "",
+        "stock_id": "", "stock_name": "",
+        "teacher_strategy_class": "未評估", "teacher_final_decision": "WATCH",
+        "teacher_light": "⚫", "teacher_gate": "NE",
+        "teacher_trade_allowed": 0, "teacher_ui_bucket": "未評估", "teacher_priority": 9999,
+        "teacher_no_trade_reason": "TeacherStrategyService 尚未完成評估或資料不足",
+        "teacher_block_reason": "",
+        "position_stage": "未知", "position_score": 0.0,
+        "two_high_fail": False, "weak_gate": "NE", "weak_score": 0.0,
+        "rotation": "未知", "rotation_level": "", "sector_strength_score": 0.0,
+        "flow_score": 0.0, "rs_score": 0.0,
+        "low_base_type": "非低位階", "low_base_score": 0.0, "low_base_reason": "",
+        "teacher_strategy_score": 0.0, "teacher_rank": 9999, "teacher_rank_seed": 9999,
+        "teacher_buy_zone": "", "teacher_stop_loss": "", "teacher_target_price": "",
         "teacher_reason": "TeacherStrategyService 未完成評估或資料不足",
-        "teacher_source": "teacher_strategy_service_v2",
+        "teacher_source": "teacher_strategy_service_v4_1_final",
     }
 
+    NUMERIC_COLUMNS = [
+        "position_score", "weak_score", "sector_strength_score", "flow_score", "rs_score",
+        "low_base_score", "teacher_strategy_score", "teacher_rank", "teacher_rank_seed",
+        "teacher_priority", "teacher_trade_allowed",
+    ]
+
+    TEXT_COLUMNS = [c for c in TEACHER_COLUMNS if c not in NUMERIC_COLUMNS and c != "two_high_fail"]
+
     def __init__(self):
-        self.engine = None
-        if TeacherStrategyEngine:
-            self.engine = TeacherStrategyEngine()
+        self.engine = TeacherStrategyEngine() if TeacherStrategyEngine else None
 
     def _default_result(self, row=None):
         out = dict(self.DEFAULT_ROW)
-
         if row is not None:
             try:
-                out["stock_id"] = str(row.get("stock_id", ""))
+                out["stock_id"] = str(row.get("stock_id", row.get("代號", "")))
             except Exception:
                 pass
-
             try:
                 out["stock_name"] = str(row.get("stock_name", row.get("名稱", "")))
             except Exception:
                 pass
-
         return out
 
     def _normalize_result(self, result, row=None):
         out = self._default_result(row)
-
         if isinstance(result, dict):
             for k, v in result.items():
                 if k in out:
                     out[k] = v
-
         if not out.get("stock_id"):
             try:
-                out["stock_id"] = str(row.get("stock_id", ""))
+                out["stock_id"] = str(row.get("stock_id", row.get("代號", "")))
             except Exception:
                 pass
-
         if not out.get("stock_name"):
             try:
                 out["stock_name"] = str(row.get("stock_name", row.get("名稱", "")))
             except Exception:
                 pass
-
         return out
 
-    def run(
-        self,
-        ranking_df=None,
-        price_history_df=None,
-        market_df=None,
-        institutional_df=None,
-        **kwargs
-    ):
-        """
-        主程式呼叫入口
-
-        Parameters:
-        ranking_df:
-            RankingEngine.rebuild() 或 trade_plan 前的股票清單
-
-        price_history_df:
-            保留給後續版本使用，目前不在 Service 層計算策略
-
-        market_df / institutional_df:
-            保留給市場級 AI / 法人資金流升級
-        """
-
+    def run(self, ranking_df=None, price_history_df=None, market_df=None, institutional_df=None, **kwargs):
         if pd is None:
             return None
-
         if ranking_df is None:
             return pd.DataFrame(columns=self.TEACHER_COLUMNS)
-
         try:
             if ranking_df.empty:
                 return pd.DataFrame(columns=self.TEACHER_COLUMNS)
@@ -144,67 +102,41 @@ class TeacherStrategyService:
             return pd.DataFrame(columns=self.TEACHER_COLUMNS)
 
         results = []
-
         if self.engine is None:
             for _, row in ranking_df.iterrows():
                 results.append(self._default_result(row))
-            return pd.DataFrame(results, columns=self.TEACHER_COLUMNS)
-
-        for _, row in ranking_df.iterrows():
-            try:
-                result = self.engine.analyze_row(row)
-                results.append(self._normalize_result(result, row))
-            except Exception as exc:
-                fallback = self._default_result(row)
-                fallback["teacher_reason"] = f"TeacherStrategy analyze_row failed: {exc}"
-                fallback["teacher_source"] = "teacher_strategy_service_v2_fallback"
-                results.append(fallback)
+        else:
+            for _, row in ranking_df.iterrows():
+                try:
+                    results.append(self._normalize_result(self.engine.analyze_row(row), row))
+                except Exception as exc:
+                    fallback = self._default_result(row)
+                    fallback["teacher_reason"] = f"TeacherStrategy analyze_row failed: {exc}"
+                    fallback["teacher_source"] = "teacher_strategy_service_v4_1_fallback"
+                    results.append(fallback)
 
         out = pd.DataFrame(results)
-
         for col in self.TEACHER_COLUMNS:
             if col not in out.columns:
                 out[col] = self.DEFAULT_ROW.get(col, "")
-
         out = out[self.TEACHER_COLUMNS].copy()
 
-        # 型別安全處理，避免主程式 merge / fillna / Excel 輸出錯誤
-        for col in [
-            "position_score",
-            "weak_score",
-            "sector_strength_score",
-            "flow_score",
-            "rs_score",
-        ]:
+        for col in self.NUMERIC_COLUMNS:
             try:
-                out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+                default = self.DEFAULT_ROW.get(col, 0.0)
+                out[col] = pd.to_numeric(out[col], errors="coerce").fillna(default)
             except Exception:
-                out[col] = 0.0
+                out[col] = self.DEFAULT_ROW.get(col, 0.0)
 
         try:
-            out["two_high_fail"] = out["two_high_fail"].fillna(False).astype(bool)
+            out["two_high_fail"] = out["two_high_fail"].fillna(False).astype(str).str.upper().isin(["TRUE", "1", "YES", "Y", "是"])
         except Exception:
             out["two_high_fail"] = False
 
-        for col in [
-            "stock_id",
-            "stock_name",
-            "teacher_strategy_class",
-            "teacher_final_decision",
-            "teacher_light",
-            "teacher_gate",
-            "position_stage",
-            "weak_gate",
-            "rotation",
-            "teacher_buy_zone",
-            "teacher_stop_loss",
-            "teacher_target_price",
-            "teacher_reason",
-            "teacher_source",
-        ]:
+        for col in self.TEXT_COLUMNS:
             try:
-                out[col] = out[col].fillna("").astype(str)
+                out[col] = out[col].fillna(self.DEFAULT_ROW.get(col, "")).astype(str)
             except Exception:
-                out[col] = ""
+                out[col] = str(self.DEFAULT_ROW.get(col, ""))
 
         return out
