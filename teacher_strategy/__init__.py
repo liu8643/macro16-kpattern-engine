@@ -1,1 +1,1 @@
-# teacher_strategy package
+"""Teacher strategy module package."""
