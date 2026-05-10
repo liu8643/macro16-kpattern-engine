@@ -1,16 +1,20 @@
-from .position_stage_engine import PositionStageEngine
-from .two_high_fail_engine import TwoHighFailEngine
-from .rotation_filter_engine import RotationFilterEngine
-from .low_base_reversal_engine import LowBaseReversalEngine
+try:
+    from .position_stage_engine import PositionStageEngine
+    from .two_high_fail_engine import TwoHighFailEngine
+    from .rotation_filter_engine import RotationFilterEngine
+    from .low_base_reversal_engine import LowBaseReversalEngine
+except Exception:  # allow direct py_compile / standalone test
+    from position_stage_engine import PositionStageEngine
+    from two_high_fail_engine import TwoHighFailEngine
+    from rotation_filter_engine import RotationFilterEngine
+    from low_base_reversal_engine import LowBaseReversalEngine
 
 
 class TeacherStrategyEngine:
-    """顧奎國老師策略主引擎 V4。
+    """顧奎國老師策略主引擎 V4.1 FINAL。
 
-    Phase4 目的：
-    1. 接入 LowBaseReversalEngine。
-    2. 輸出 teacher_strategy_score / teacher_rank_seed / teacher_block_reason。
-    3. Engine 只做策略計算，不做 UI。
+    只做策略計算，不做 UI。
+    輸出固定欄位給 services.teacher_strategy_service，再由主程式 merge / display / export。
     """
 
     def __init__(self):
@@ -38,13 +42,13 @@ class TeacherStrategyEngine:
             return default
 
     def _price_zone(self, row):
-        close = self._num(row, "close")
-        ma20 = self._num(row, "ma20")
-        ma60 = self._num(row, "ma60")
+        close = self._num(row, "close", self._num(row, "現價", 0.0))
+        ma20 = self._num(row, "ma20", 0.0)
+        ma60 = self._num(row, "ma60", 0.0)
         atr_pct = self._num(row, "atr_pct", 0.03)
         if close <= 0:
             return "", "", ""
-        if atr_pct <= 0:
+        if atr_pct <= 0 or atr_pct > 0.20:
             atr_pct = 0.03
         entry_low = close * (1 - atr_pct * 0.8)
         entry_high = close * (1 - atr_pct * 0.2)
@@ -55,7 +59,8 @@ class TeacherStrategyEngine:
         return f"{entry_low:.2f} ~ {entry_high:.2f}", f"{stop_loss:.2f}", f"{target_price:.2f}"
 
     def _calc_gate(self, decision):
-        if decision in ("BUY", "LOW BUY", "LOW_BUY"):
+        decision = str(decision or "").upper().replace(" ", "_")
+        if decision in ("BUY", "LOW_BUY"):
             return "PASS"
         if decision in ("WAIT_PULLBACK", "WATCH"):
             return "WATCH"
@@ -77,8 +82,8 @@ class TeacherStrategyEngine:
         return max(0.0, min(100.0, round(score, 2)))
 
     def analyze_row(self, row):
-        stock_id = self._text(row, "stock_id")
-        stock_name = self._text(row, "stock_name")
+        stock_id = self._text(row, "stock_id", self._text(row, "代號", ""))
+        stock_name = self._text(row, "stock_name", self._text(row, "名稱", ""))
 
         position_result = self.position_engine.analyze(row)
         position_stage = position_result.get("position_stage", "未知") if isinstance(position_result, dict) else str(position_result)
@@ -88,7 +93,7 @@ class TeacherStrategyEngine:
         two_high_result = self.two_high_engine.analyze(row)
         if isinstance(two_high_result, dict):
             two_high_fail = bool(two_high_result.get("two_high_fail", False))
-            weak_gate = two_high_result.get("weak_gate", "PASS")
+            weak_gate = str(two_high_result.get("weak_gate", "PASS")).upper()
             weak_score = self._num(two_high_result, "weak_score", 0)
             weak_reason = two_high_result.get("weak_reason", "")
         else:
@@ -141,9 +146,9 @@ class TeacherStrategyEngine:
             teacher_final_decision = "BUY"
             teacher_light = "🟢"
             reason_parts.append("主升3浪 + 類股強 + 資金/RS支撐，列入老師策略主攻")
-        elif (position_stage in ("主升初段", "低位階翻多") or low_base_score >= 75) and sector_strength_score >= 55:
+        elif (position_stage in ("主升初段", "低位階翻多") or low_base_score >= 75) and sector_strength_score >= 45:
             teacher_strategy_class = "低接"
-            teacher_final_decision = "LOW BUY"
+            teacher_final_decision = "LOW_BUY"
             teacher_light = "🟢"
             reason_parts.append("低位階翻多或主升初段，適合拉回低接與卡位")
         elif position_stage == "中位階整理" and rs_score >= 50:
@@ -165,7 +170,7 @@ class TeacherStrategyEngine:
         else:
             reason_parts.append("條件尚未形成主攻或低接，列觀察")
 
-        if rr and rr < 1.0 and teacher_final_decision in ("BUY", "LOW BUY", "LOW_BUY"):
+        if rr and rr < 1.0 and teacher_final_decision in ("BUY", "LOW_BUY"):
             teacher_final_decision = "WATCH"
             teacher_light = "🔵"
             teacher_strategy_class = "觀察"
@@ -174,7 +179,7 @@ class TeacherStrategyEngine:
 
         for txt in [position_reason, low_base_reason, weak_reason, rotation_reason]:
             if txt:
-                reason_parts.append(txt)
+                reason_parts.append(str(txt))
 
         teacher_block_reason = "；".join(block_reasons) if block_reasons else ""
         return {
@@ -184,6 +189,7 @@ class TeacherStrategyEngine:
             "teacher_final_decision": teacher_final_decision,
             "teacher_light": teacher_light,
             "teacher_gate": self._calc_gate(teacher_final_decision),
+            "teacher_block_reason": teacher_block_reason,
             "position_stage": position_stage,
             "position_score": round(position_score, 2),
             "two_high_fail": two_high_fail,
@@ -199,10 +205,9 @@ class TeacherStrategyEngine:
             "low_base_reason": low_base_reason,
             "teacher_strategy_score": round(teacher_strategy_score, 2),
             "teacher_rank_seed": int(teacher_rank_seed),
-            "teacher_block_reason": teacher_block_reason,
             "teacher_buy_zone": teacher_buy_zone,
             "teacher_stop_loss": teacher_stop_loss,
             "teacher_target_price": teacher_target_price,
             "teacher_reason": "；".join(reason_parts),
-            "teacher_source": "teacher_strategy_engine_v4_trade_layer",
+            "teacher_source": "teacher_strategy_engine_v4_1_final_trade_layer",
         }
