@@ -96,6 +96,17 @@ except Exception as _service_import_exc:
                     print(f"[KPatternService][fallback] called successfully｜{KPATTERN_SERVICE_IMPORT_STATUS}")
                     return df
 
+# Teacher Strategy 模組化安全接入點（V17 TEACHER_STRATEGY_HOOK）
+# 原則：主程式只做 Hook / merge / display / export，不把顧奎國老師策略邏輯塞回主程式。
+# 主要邏輯放在 teacher_strategy/；服務接線放在 services/teacher_strategy_service.py。
+try:
+    from services.teacher_strategy_service import TeacherStrategyService as _ExternalTeacherStrategyService
+    TeacherStrategyService = _ExternalTeacherStrategyService
+    TEACHER_STRATEGY_IMPORT_STATUS = "external_service_loaded"
+except Exception as _teacher_service_import_exc:
+    TeacherStrategyService = None
+    TEACHER_STRATEGY_IMPORT_STATUS = f"teacher_strategy_service_unavailable: {_teacher_service_import_exc}"
+
 
 # KPattern 固定欄位：主程式只讀這組輸出，後續擴充只改 kpattern_module。
 KPATTERN_RANKING_COLUMNS = [
@@ -165,6 +176,94 @@ def apply_kpattern_pipeline_safe(df, price_history=None, context: str = ""):
                 out[col] = default
         return out
     except Exception:
+        return out
+
+
+TEACHER_STRATEGY_COLUMNS = [
+    "teacher_strategy_class", "teacher_final_decision", "teacher_light",
+    "position_stage", "two_high_fail", "rotation", "sector_strength_score",
+    "flow_score", "rs_score", "teacher_buy_zone", "teacher_stop_loss",
+    "teacher_target_price", "teacher_reason", "teacher_gate", "teacher_source",
+]
+
+
+def _teacher_strategy_default_payload() -> dict:
+    return {
+        "teacher_strategy_class": "未評估",
+        "teacher_final_decision": "WATCH",
+        "teacher_light": "⚫",
+        "position_stage": "未知",
+        "two_high_fail": False,
+        "rotation": "未知",
+        "sector_strength_score": 0.0,
+        "flow_score": 0.0,
+        "rs_score": 0.0,
+        "teacher_buy_zone": "",
+        "teacher_stop_loss": "",
+        "teacher_target_price": "",
+        "teacher_reason": "TeacherStrategy 尚未接入或資料不足",
+        "teacher_gate": "NE",
+        "teacher_source": TEACHER_STRATEGY_IMPORT_STATUS,
+    }
+
+
+def apply_teacher_strategy_pipeline_safe(ranking_df, price_history_df=None, market_df=None, institutional_df=None, context: str = "", log_cb=None):
+    """主程式固定 Teacher Strategy Hook。
+    只呼叫 services.teacher_strategy_service，不在主程式內寫老師策略判斷邏輯。
+    失敗時回傳原 ranking_df 並補中性欄位，避免 UI / Excel / DB 因缺欄位中斷。
+    """
+    if ranking_df is None:
+        return ranking_df
+    out = ranking_df.copy()
+    defaults = _teacher_strategy_default_payload()
+    try:
+        if TeacherStrategyService is None:
+            for col, default in defaults.items():
+                if col not in out.columns:
+                    out[col] = default
+            return out
+        teacher_df = TeacherStrategyService().run(
+            ranking_df=out,
+            price_history_df=price_history_df,
+            market_df=market_df,
+            institutional_df=institutional_df,
+        )
+        if teacher_df is not None and isinstance(teacher_df, pd.DataFrame) and not teacher_df.empty:
+            if "stock_id" in teacher_df.columns and "stock_id" in out.columns:
+                teacher_df = teacher_df.drop_duplicates(subset=["stock_id"], keep="last")
+                # 避免重複欄位造成 _x/_y 污染；老師策略欄位以最新 service 結果為準。
+                drop_cols = [c for c in TEACHER_STRATEGY_COLUMNS if c in out.columns]
+                if drop_cols:
+                    out = out.drop(columns=drop_cols, errors="ignore")
+                out = out.merge(teacher_df, on="stock_id", how="left")
+            else:
+                for col in teacher_df.columns:
+                    if col not in out.columns and len(teacher_df[col]) == len(out):
+                        out[col] = teacher_df[col].values
+        for col, default in defaults.items():
+            if col not in out.columns:
+                out[col] = default
+            else:
+                out[col] = out[col].fillna(default)
+        try:
+            msg = f"[TeacherStrategy] merged context={context} rows={len(out)} status={TEACHER_STRATEGY_IMPORT_STATUS}"
+            if log_cb:
+                log_cb(msg)
+            log_info(msg)
+        except Exception:
+            pass
+        return out
+    except Exception as exc:
+        try:
+            msg = f"[TeacherStrategy] pipeline skipped context={context}: {exc}"
+            if log_cb:
+                log_cb(msg)
+            log_warning(msg)
+        except Exception:
+            pass
+        for col, default in defaults.items():
+            if col not in out.columns:
+                out[col] = default
         return out
 
 
@@ -2663,6 +2762,25 @@ class DBManager:
             _add("ranking_result", col, ddl)
 
         for col, ddl in [
+            ("teacher_strategy_class", "teacher_strategy_class TEXT DEFAULT '未評估'"),
+            ("teacher_final_decision", "teacher_final_decision TEXT DEFAULT 'WATCH'"),
+            ("teacher_light", "teacher_light TEXT DEFAULT '⚫'"),
+            ("position_stage", "position_stage TEXT DEFAULT '未知'"),
+            ("two_high_fail", "two_high_fail INTEGER DEFAULT 0"),
+            ("rotation", "rotation TEXT DEFAULT '未知'"),
+            ("sector_strength_score", "sector_strength_score REAL DEFAULT 0"),
+            ("flow_score", "flow_score REAL DEFAULT 0"),
+            ("rs_score", "rs_score REAL DEFAULT 0"),
+            ("teacher_buy_zone", "teacher_buy_zone TEXT DEFAULT ''"),
+            ("teacher_stop_loss", "teacher_stop_loss TEXT DEFAULT ''"),
+            ("teacher_target_price", "teacher_target_price TEXT DEFAULT ''"),
+            ("teacher_reason", "teacher_reason TEXT DEFAULT ''"),
+            ("teacher_gate", "teacher_gate TEXT DEFAULT 'NE'"),
+            ("teacher_source", "teacher_source TEXT DEFAULT ''"),
+        ]:
+            _add("ranking_result", col, ddl)
+
+        for col, ddl in [
             ("external_data_ready", "external_data_ready INTEGER DEFAULT 0"),
             ("external_blocking_reason", "external_blocking_reason TEXT"),
             ("analysis_ready", "analysis_ready INTEGER DEFAULT 1"),
@@ -2719,6 +2837,21 @@ class DBManager:
             ("price_deviation", "price_deviation REAL"),
             ("model_score", "model_score REAL"),
             ("wave_trade_score", "wave_trade_score REAL"),
+            ("teacher_strategy_class", "teacher_strategy_class TEXT DEFAULT '未評估'"),
+            ("teacher_final_decision", "teacher_final_decision TEXT DEFAULT 'WATCH'"),
+            ("teacher_light", "teacher_light TEXT DEFAULT '⚫'"),
+            ("position_stage", "position_stage TEXT DEFAULT '未知'"),
+            ("two_high_fail", "two_high_fail INTEGER DEFAULT 0"),
+            ("rotation", "rotation TEXT DEFAULT '未知'"),
+            ("sector_strength_score", "sector_strength_score REAL DEFAULT 0"),
+            ("flow_score", "flow_score REAL DEFAULT 0"),
+            ("rs_score", "rs_score REAL DEFAULT 0"),
+            ("teacher_buy_zone", "teacher_buy_zone TEXT DEFAULT ''"),
+            ("teacher_stop_loss", "teacher_stop_loss TEXT DEFAULT ''"),
+            ("teacher_target_price", "teacher_target_price TEXT DEFAULT ''"),
+            ("teacher_reason", "teacher_reason TEXT DEFAULT ''"),
+            ("teacher_gate", "teacher_gate TEXT DEFAULT 'NE'"),
+            ("teacher_source", "teacher_source TEXT DEFAULT ''"),
         ]:
             _add("trade_plan", col, ddl)
 
@@ -2851,19 +2984,23 @@ class DBManager:
             "retail_heat_score": 50.0, "margin_score": 50.0, "margin_state": "NE", "macro_margin_score": 50.0, "macro_margin_state": "NE", "margin_decision_note": "",
             "fail_reason": "", "rsi": np.nan, "atr_pct": np.nan, "price_deviation": np.nan, "model_score": np.nan, "wave_trade_score": np.nan,
         }
+        defaults.update(_teacher_strategy_default_payload())
         for c, d in defaults.items():
             if c not in x.columns:
                 x[c] = d
         if "entry_mid" in x.columns:
             close_series = pd.to_numeric(x["close"], errors="coerce").fillna(0)
             x.loc[close_series.eq(0), "close"] = pd.to_numeric(x.loc[close_series.eq(0), "entry_mid"], errors="coerce").fillna(0)
-        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score", "financial_score", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "macro_margin_score", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score"]:
+        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score", "financial_score", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "macro_margin_score", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score", "sector_strength_score", "flow_score", "rs_score"]:
             x[c] = pd.to_numeric(x[c], errors="coerce")
         for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "analysis_ready", "execution_ready", "soft_block"]:
             if c not in x.columns:
                 x[c] = 0
             x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0).astype(int)
         keep = ["run_id", "plan_date", "stock_id", "stock_name", "market", "industry", "theme", "close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "gate_summary", "decision_reason", "final_trade_decision", "ui_state", "pool_role", "source_rank", "external_data_ready", "external_blocking_reason", "fail_reason", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score", "analysis_ready", "execution_ready", "soft_block", "block_reason", "execution_block_reason", "pipeline_run_id", "external_run_id", "decision_run_id", "market_gate_state", "flow_gate_state", "fundamental_gate_state", "event_gate_state", "risk_gate_state", "latest_external_date", "market_source_level", "source_trace_json", "decision_reason_short", "global_external_ready", "stock_external_coverage_state", "gate_policy_note", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "eps_bucket", "rev_bucket", "matrix_cell", "eps_category", "matrix_base_score", "modifier", "revenue_eps_score", "data_quality_flag", "financial_score", "eps_matrix_decision_note", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "margin_state", "macro_margin_score", "macro_margin_state", "margin_decision_note", "update_time"]
+        for _teacher_col in TEACHER_STRATEGY_COLUMNS:
+            if _teacher_col not in keep:
+                keep.append(_teacher_col)
         x = x[keep].drop_duplicates(subset=["run_id", "stock_id", "source_rank"], keep="first")
         with self.lock:
             self.conn.execute("DELETE FROM trade_plan WHERE run_id=?", (run_id,))
@@ -3576,6 +3713,7 @@ class RankingEngine:
         df["rank_all"] = np.arange(1, len(df) + 1)
         merged = df.merge(master[["stock_id", "industry"]], on="stock_id", how="left")
         df["rank_industry"] = merged.groupby("industry")["total_score"].rank(method="dense", ascending=False).astype(int)
+        df = apply_teacher_strategy_pipeline_safe(df, price_history_df=None, context="ranking_rebuild", log_cb=log_cb)
         self.db.replace_ranking(df)
         self.db.log_system_run(event="ranking_rebuild", status="ok", message=f"ranking rows={len(df)} with FUNDAMENTAL_LOCAL_CACHE", run_id=run_id, module="ranking")
         return len(df)
@@ -7073,6 +7211,10 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col, default in [("analysis_ready", 1), ("execution_ready", 0), ("soft_block", 0), ("block_reason", ""), ("execution_block_reason", "")]:
         if col not in x.columns:
             x[col] = default
+    # V17 Teacher Strategy：補齊老師策略欄位，UI/Excel 僅呈現不重算。
+    for col, default in _teacher_strategy_default_payload().items():
+        if col not in x.columns:
+            x[col] = default
 
 
     def _log_missing_columns(*cols: str):
@@ -7177,6 +7319,10 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         ("資料來源層級", "market_source_level"), ("決策摘要", "decision_reason_short"),
         ("全域外部Ready", "global_external_ready"), ("個股覆蓋狀態", "stock_external_coverage_state"),
         ("Gate說明", "gate_policy_note"),
+        ("老師策略", "teacher_strategy_class"), ("老師決策", "teacher_final_decision"), ("老師燈號", "teacher_light"),
+        ("位階判斷", "position_stage"), ("兩高不過", "two_high_fail"), ("類股輪動", "rotation"),
+        ("類股強度", "sector_strength_score"), ("資金流向分", "flow_score"), ("相對強弱RS", "rs_score"),
+        ("老師買點", "teacher_buy_zone"), ("老師停損", "teacher_stop_loss"), ("老師目標", "teacher_target_price"), ("老師理由", "teacher_reason"),
         ("代號", "stock_id"), ("名稱", "stock_name"), ("優先級", "priority"), ("優先級", "優先級"),
     ]
     for zh, src in alias_pairs:
@@ -9533,7 +9679,7 @@ class AppUI:
         ttk.Label(row2, text="下載").pack(side="left")
         self.download_target_var = tk.StringVar(value="TOP20")
         self.download_target_cb = ttk.Combobox(row2, textvariable=self.download_target_var, width=12, state="readonly")
-        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可下單", "等待回測", "條件預掛", "主攻", "次強", "防守", "執行下單清單", "組合交易計畫", "唯一決策", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
+        self.download_target_cb["values"] = ["TOP20", "TOP5", "今日可下單", "等待回測", "條件預掛", "主攻", "次強", "防守", "執行下單清單", "組合交易計畫", "唯一決策", "老師策略", "操作SOP", "排行", "類股", "題材", "未分類清單", "分類V2摘要"]
         self.download_target_cb.pack(side="left", padx=4)
         self.btn_export_data = ttk.Button(row2, text="下載資料", command=self.export_selected_data)
         self.btn_export_data.pack(side="left", padx=(4, 12))
@@ -9572,6 +9718,7 @@ class AppUI:
         self.tab_top20 = ttk.Frame(self.left_notebook)
         self.tab_top5 = ttk.Frame(self.left_notebook)
         self.tab_unique = ttk.Frame(self.left_notebook)
+        self.tab_teacher = ttk.Frame(self.left_notebook)
         self.tab_order = ttk.Frame(self.left_notebook)
         self.tab_inst = ttk.Frame(self.left_notebook)
         self.tab_external = ttk.Frame(self.left_notebook)
@@ -9586,6 +9733,7 @@ class AppUI:
         self.left_notebook.add(self.tab_top20, text="強勢候選20")
         self.left_notebook.add(self.tab_top5, text="主攻5")
         self.left_notebook.add(self.tab_unique, text="唯一決策")
+        self.left_notebook.add(self.tab_teacher, text="老師策略")
         self.left_notebook.add(self.tab_order, text="執行下單清單")
         self.left_notebook.add(self.tab_inst, text="組合交易計畫")
         self.left_notebook.add(self.tab_external, text="外部資料中心")
@@ -9633,6 +9781,13 @@ class AppUI:
             "rank": "排序", "id": "代號", "name": "名稱", "trade_allowed": "可下單", "market_gate": "Market", "flow_gate": "Flow", "fund_gate": "Fundamental", "event_gate": "Event", "risk_gate": "Risk", "external_ready": "ExternalReady", "source_date": "外部資料日", "source_level": "來源層級", "block_reason": "阻擋原因", "decision": "決策摘要"
         })
         self.unique_tree.bind("<<TreeviewSelect>>", self.on_select_unique)
+
+        self.teacher_tree = self._make_tree(self.tab_teacher, ("rank", "id", "name", "light", "teacher_decision", "position", "two_high", "rotation", "sector_strength", "flow", "rs", "buy_zone", "stop", "target", "reason"), {
+            "rank": "排序", "id": "代號", "name": "名稱", "light": "燈號", "teacher_decision": "老師決策",
+            "position": "位階", "two_high": "兩高不過", "rotation": "類股輪動", "sector_strength": "類股強度",
+            "flow": "資金流向分", "rs": "相對強弱RS", "buy_zone": "買點", "stop": "停損", "target": "目標", "reason": "老師理由"
+        })
+        self.teacher_tree.bind("<<TreeviewSelect>>", self.on_select_teacher)
 
         self.order_tree = self._make_tree(self.tab_order, ("priority", "id", "name", "price", "chg", "chg_pct", "bucket", "action", "liquidity", "liq_score", "entry", "stop", "target1382", "target1618", "rr", "win_rate", "atr_pct", "kelly_pct", "qty", "amount", "single_pct", "portfolio_state", "risk_note", "trade_allowed", "market_gate", "flow_gate", "fund_gate", "event_gate", "risk_gate", "block_reason"), {
             "priority": "優先級", "id": "代號", "name": "名稱", "price": "現價", "chg": "漲跌", "chg_pct": "漲跌幅%", "bucket": "分類", "action": "狀態", "liquidity": "盤中狀態", "liq_score": "活性分", "entry": "進場區", "stop": "停損", "target1382": "1.382", "target1618": "1.618", "rr": "RR", "win_rate": "勝率%", "atr_pct": "ATR%", "kelly_pct": "Kelly%", "qty": "建議張數", "amount": "建議金額", "single_pct": "單檔曝險%", "portfolio_state": "組合狀態", "risk_note": "風險備註", "trade_allowed": "外部允許", "market_gate": "Market", "flow_gate": "Flow", "fund_gate": "Fundamental", "event_gate": "Event", "risk_gate": "Risk", "block_reason": "外部阻擋"
@@ -11279,6 +11434,51 @@ class AppUI:
                 except Exception:
                     pass
 
+    def refresh_teacher_strategy_table(self, df: pd.DataFrame | None = None):
+        """刷新老師策略分頁。UI 僅讀取 teacher_result 欄位，不在 UI 重新計算。"""
+        try:
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                df = getattr(self, "last_top20_df", pd.DataFrame())
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                df = self.db.get_latest_ranking()
+            if df is None or df.empty or not hasattr(self, "teacher_tree"):
+                return
+            x = self.enrich_price_and_export_fields(df.copy(), id_col="stock_id" if "stock_id" in df.columns else None)
+            sort_cols = [c for c in ["teacher_final_decision", "rank_all"] if c in x.columns]
+            if sort_cols:
+                x = x.sort_values(sort_cols, ascending=[True] * len(sort_cols)).copy()
+            self.teacher_tree.delete(*self.teacher_tree.get_children())
+            for i, (_, r) in enumerate(x.head(200).iterrows(), start=1):
+                vals = (
+                    i,
+                    r.get("stock_id", r.get("代號", "")),
+                    r.get("stock_name", r.get("名稱", "")),
+                    r.get("teacher_light", r.get("老師燈號", "⚫")),
+                    r.get("teacher_final_decision", r.get("老師決策", "WATCH")),
+                    r.get("position_stage", r.get("位階判斷", "未知")),
+                    r.get("two_high_fail", r.get("兩高不過", False)),
+                    r.get("rotation", r.get("類股輪動", "未知")),
+                    r.get("sector_strength_score", r.get("類股強度", 0)),
+                    r.get("flow_score", r.get("資金流向分", 0)),
+                    r.get("rs_score", r.get("相對強弱RS", 0)),
+                    r.get("teacher_buy_zone", r.get("老師買點", "")),
+                    r.get("teacher_stop_loss", r.get("老師停損", "")),
+                    r.get("teacher_target_price", r.get("老師目標", "")),
+                    r.get("teacher_reason", r.get("老師理由", "")),
+                )
+                self.teacher_tree.insert("", "end", values=vals)
+        except Exception as exc:
+            log_warning(f"刷新老師策略分頁失敗：{exc}")
+
+    def on_select_teacher(self, event=None):
+        try:
+            item = self.teacher_tree.selection()[0]
+            vals = self.teacher_tree.item(item, "values")
+            if vals and len(vals) >= 2:
+                self.select_stock(str(vals[1]), source="teacher_strategy")
+        except Exception:
+            pass
+
     def export_selected_data(self):
         target = self.download_target_var.get().strip() or "TOP20"
 
@@ -11518,6 +11718,29 @@ class AppUI:
                 unique_df = getattr(self, "last_unique_decision_df", pd.DataFrame())
                 if unique_df is not None and not unique_df.empty:
                     tables["Unique_Decision"] = self.enrich_price_and_export_fields(unique_df, id_col="stock_id")
+                try:
+                    teacher_source = tables.get("Ranking", self.db.get_latest_ranking())
+                    teacher_source = self.enrich_price_and_export_fields(teacher_source, id_col="stock_id") if teacher_source is not None and not teacher_source.empty else pd.DataFrame()
+                    teacher_cols = [c for c in ["stock_id", "stock_name", "老師燈號", "老師決策", "老師策略", "位階判斷", "兩高不過", "類股輪動", "類股強度", "資金流向分", "相對強弱RS", "老師買點", "老師停損", "老師目標", "老師理由", "現價", "RR", "勝率"] if c in teacher_source.columns]
+                    if teacher_source is not None and not teacher_source.empty and teacher_cols:
+                        teacher_view = teacher_source[teacher_cols].copy()
+                        tables["老師策略_TOP10"] = teacher_view.head(10)
+                        if "老師決策" in teacher_view.columns:
+                            tables["今日可買清單"] = teacher_view[teacher_view["老師決策"].astype(str).isin(["BUY", "LOW BUY", "LOW_BUY"])].copy()
+                            tables["等拉回清單"] = teacher_view[teacher_view["老師決策"].astype(str).str.contains("WAIT|WATCH|拉回", case=False, na=False)].copy()
+                            tables["兩高不過排除清單"] = teacher_view[(teacher_view.get("兩高不過", "").astype(str).isin(["True", "1", "YES", "是"])) | (teacher_view["老師決策"].astype(str).str.contains("AVOID|REDUCE|排除", case=False, na=False))].copy()
+                        tables["低位階翻多清單"] = teacher_view[teacher_view.get("位階判斷", "").astype(str).str.contains("低位階|翻多", na=False)].copy() if "位階判斷" in teacher_view.columns else pd.DataFrame(columns=teacher_cols)
+                        if "類股輪動" in teacher_view.columns:
+                            tables["類股輪動強弱表"] = teacher_view.groupby("類股輪動", dropna=False).size().reset_index(name="檔數")
+                        if "資金流向分" in teacher_view.columns:
+                            tables["資金流入排行"] = teacher_view.sort_values("資金流向分", ascending=False).head(50)
+                        tables["策略公式與欄位來源"] = pd.DataFrame([
+                            {"欄位": "teacher_final_decision", "來源": "services.teacher_strategy_service → teacher_strategy_engine", "原則": "UI/Excel只呈現，不重算"},
+                            {"欄位": "two_high_fail", "來源": "two_high_fail_engine", "原則": "兩高不過不得進今日可買"},
+                            {"欄位": "position_stage", "來源": "position_stage_engine", "原則": "低位階翻多優先觀察/低接"},
+                        ])
+                except Exception as exc:
+                    tables["Teacher_Strategy_Error"] = pd.DataFrame([{"error": str(exc)}])
                 tables["Daily_Summary"] = self.build_daily_summary_sheet()
                 tables["Summary"] = self.build_daily_summary_sheet()
                 tables["Report_Guide"] = self.build_report_usage_sheet()
