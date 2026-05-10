@@ -181,9 +181,11 @@ def apply_kpattern_pipeline_safe(df, price_history=None, context: str = ""):
 
 TEACHER_STRATEGY_COLUMNS = [
     "teacher_strategy_class", "teacher_final_decision", "teacher_light",
-    "position_stage", "two_high_fail", "rotation", "sector_strength_score",
+    "teacher_gate", "position_stage", "position_score",
+    "two_high_fail", "weak_gate", "weak_score",
+    "rotation", "sector_strength_score",
     "flow_score", "rs_score", "teacher_buy_zone", "teacher_stop_loss",
-    "teacher_target_price", "teacher_reason", "teacher_gate", "teacher_source",
+    "teacher_target_price", "teacher_reason", "teacher_source",
 ]
 
 
@@ -192,8 +194,12 @@ def _teacher_strategy_default_payload() -> dict:
         "teacher_strategy_class": "未評估",
         "teacher_final_decision": "WATCH",
         "teacher_light": "⚫",
+        "teacher_gate": "NE",
         "position_stage": "未知",
+        "position_score": 0.0,
         "two_high_fail": False,
+        "weak_gate": "NE",
+        "weak_score": 0.0,
         "rotation": "未知",
         "sector_strength_score": 0.0,
         "flow_score": 0.0,
@@ -202,7 +208,6 @@ def _teacher_strategy_default_payload() -> dict:
         "teacher_stop_loss": "",
         "teacher_target_price": "",
         "teacher_reason": "TeacherStrategy 尚未接入或資料不足",
-        "teacher_gate": "NE",
         "teacher_source": TEACHER_STRATEGY_IMPORT_STATUS,
     }
 
@@ -378,7 +383,7 @@ def get_runtime_dir() -> Path:
 
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
-APP_NAME = "GTC AI Trading System v9.6.2 PRO FUNDAMENTAL_LOCAL_CACHE V16.2-R10_MARKET_SNAPSHOT_FULL_FALLBACK_AND_FAIL_REASON"
+APP_NAME = "GTC AI Trading System v9.6.2 PRO V17-TEACHER_STRATEGY_FIELD_SYNC"
 
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
@@ -2765,8 +2770,12 @@ class DBManager:
             ("teacher_strategy_class", "teacher_strategy_class TEXT DEFAULT '未評估'"),
             ("teacher_final_decision", "teacher_final_decision TEXT DEFAULT 'WATCH'"),
             ("teacher_light", "teacher_light TEXT DEFAULT '⚫'"),
+            ("teacher_gate", "teacher_gate TEXT DEFAULT 'NE'"),
             ("position_stage", "position_stage TEXT DEFAULT '未知'"),
+            ("position_score", "position_score REAL DEFAULT 0"),
             ("two_high_fail", "two_high_fail INTEGER DEFAULT 0"),
+            ("weak_gate", "weak_gate TEXT DEFAULT 'NE'"),
+            ("weak_score", "weak_score REAL DEFAULT 0"),
             ("rotation", "rotation TEXT DEFAULT '未知'"),
             ("sector_strength_score", "sector_strength_score REAL DEFAULT 0"),
             ("flow_score", "flow_score REAL DEFAULT 0"),
@@ -2775,7 +2784,6 @@ class DBManager:
             ("teacher_stop_loss", "teacher_stop_loss TEXT DEFAULT ''"),
             ("teacher_target_price", "teacher_target_price TEXT DEFAULT ''"),
             ("teacher_reason", "teacher_reason TEXT DEFAULT ''"),
-            ("teacher_gate", "teacher_gate TEXT DEFAULT 'NE'"),
             ("teacher_source", "teacher_source TEXT DEFAULT ''"),
         ]:
             _add("ranking_result", col, ddl)
@@ -2840,8 +2848,12 @@ class DBManager:
             ("teacher_strategy_class", "teacher_strategy_class TEXT DEFAULT '未評估'"),
             ("teacher_final_decision", "teacher_final_decision TEXT DEFAULT 'WATCH'"),
             ("teacher_light", "teacher_light TEXT DEFAULT '⚫'"),
+            ("teacher_gate", "teacher_gate TEXT DEFAULT 'NE'"),
             ("position_stage", "position_stage TEXT DEFAULT '未知'"),
+            ("position_score", "position_score REAL DEFAULT 0"),
             ("two_high_fail", "two_high_fail INTEGER DEFAULT 0"),
+            ("weak_gate", "weak_gate TEXT DEFAULT 'NE'"),
+            ("weak_score", "weak_score REAL DEFAULT 0"),
             ("rotation", "rotation TEXT DEFAULT '未知'"),
             ("sector_strength_score", "sector_strength_score REAL DEFAULT 0"),
             ("flow_score", "flow_score REAL DEFAULT 0"),
@@ -2850,7 +2862,6 @@ class DBManager:
             ("teacher_stop_loss", "teacher_stop_loss TEXT DEFAULT ''"),
             ("teacher_target_price", "teacher_target_price TEXT DEFAULT ''"),
             ("teacher_reason", "teacher_reason TEXT DEFAULT ''"),
-            ("teacher_gate", "teacher_gate TEXT DEFAULT 'NE'"),
             ("teacher_source", "teacher_source TEXT DEFAULT ''"),
         ]:
             _add("trade_plan", col, ddl)
@@ -2991,7 +3002,7 @@ class DBManager:
         if "entry_mid" in x.columns:
             close_series = pd.to_numeric(x["close"], errors="coerce").fillna(0)
             x.loc[close_series.eq(0), "close"] = pd.to_numeric(x.loc[close_series.eq(0), "entry_mid"], errors="coerce").fillna(0)
-        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score", "financial_score", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "macro_margin_score", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score", "sector_strength_score", "flow_score", "rs_score"]:
+        for c in ["close", "entry_low", "entry_high", "stop_loss", "target_price", "target_1382", "target_1618", "rr", "rr_live", "win_rate", "pe", "pb", "dividend_yield", "eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score", "financial_score", "valuation_score", "margin_balance", "short_balance", "margin_change", "short_change", "margin_utilization", "retail_heat_score", "margin_score", "macro_margin_score", "rsi", "atr_pct", "price_deviation", "model_score", "wave_trade_score", "position_score", "weak_score", "sector_strength_score", "flow_score", "rs_score"]:
             x[c] = pd.to_numeric(x[c], errors="coerce")
         for c in ["market_gate", "flow_gate", "fundamental_gate", "event_gate", "technical_gate", "risk_gate", "trade_allowed", "analysis_ready", "execution_ready", "soft_block"]:
             if c not in x.columns:
@@ -7320,7 +7331,8 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         ("全域外部Ready", "global_external_ready"), ("個股覆蓋狀態", "stock_external_coverage_state"),
         ("Gate說明", "gate_policy_note"),
         ("老師策略", "teacher_strategy_class"), ("老師決策", "teacher_final_decision"), ("老師燈號", "teacher_light"),
-        ("位階判斷", "position_stage"), ("兩高不過", "two_high_fail"), ("類股輪動", "rotation"),
+        ("老師Gate", "teacher_gate"), ("位階判斷", "position_stage"), ("位階分數", "position_score"),
+        ("兩高不過", "two_high_fail"), ("弱勢Gate", "weak_gate"), ("弱勢分數", "weak_score"), ("類股輪動", "rotation"),
         ("類股強度", "sector_strength_score"), ("資金流向分", "flow_score"), ("相對強弱RS", "rs_score"),
         ("老師買點", "teacher_buy_zone"), ("老師停損", "teacher_stop_loss"), ("老師目標", "teacher_target_price"), ("老師理由", "teacher_reason"),
         ("代號", "stock_id"), ("名稱", "stock_name"), ("優先級", "priority"), ("優先級", "優先級"),
@@ -7349,7 +7361,7 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         x["優先級"] = pd.to_numeric(_safe_first_series(["priority", "優先級"], default=np.nan, numeric=True), errors="coerce")
         x["優先級"] = x["優先級"].fillna(pd.Series(np.arange(1, len(x) + 1), index=x.index))
 
-    numeric_display = ["1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "活性分", "模型分數", "交易分數", "現價", "漲跌", "漲跌幅%", "建議張數", "建議金額", "PE", "PB", "殖利率%", "EPS_TTM", "EPS YoY", "營收YoY", "財務分數", "估值分"]
+    numeric_display = ["1.382", "1.618", "RR", "勝率", "ATR%", "Kelly%", "活性分", "模型分數", "交易分數", "現價", "漲跌", "漲跌幅%", "建議張數", "建議金額", "PE", "PB", "殖利率%", "EPS_TTM", "EPS YoY", "營收YoY", "財務分數", "估值分", "位階分數", "弱勢分數", "類股強度", "資金流向分", "相對強弱RS"]
     for col in numeric_display:
         if col in x.columns:
             x[col] = pd.to_numeric(x[col], errors="coerce")
