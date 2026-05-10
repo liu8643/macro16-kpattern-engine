@@ -208,15 +208,23 @@ def _teacher_strategy_default_payload() -> dict:
         "teacher_ui_bucket": "未評估",
         "teacher_priority": 9999,
         "teacher_no_trade_reason": "TeacherStrategy 尚未接管交易總閘",
+        "teacher_block_reason": "",
         "position_stage": "未知",
         "position_score": 0.0,
         "two_high_fail": False,
         "weak_gate": "NE",
         "weak_score": 0.0,
         "rotation": "未知",
+        "rotation_level": "",
         "sector_strength_score": 0.0,
         "flow_score": 0.0,
         "rs_score": 0.0,
+        "low_base_type": "非低位階",
+        "low_base_score": 0.0,
+        "low_base_reason": "",
+        "teacher_strategy_score": 0.0,
+        "teacher_rank": 9999,
+        "teacher_rank_seed": 9999,
         "teacher_buy_zone": "",
         "teacher_stop_loss": "",
         "teacher_target_price": "",
@@ -351,6 +359,84 @@ def finalize_teacher_strategy_fields(df: pd.DataFrame) -> pd.DataFrame:
     x["teacher_block_reason"] = existing_block.where(existing_block.str.strip().ne(""), pd.Series(reasons, index=x.index)).fillna("").astype(str)
     return x
 
+def enrich_teacher_strategy_input_fields(df: pd.DataFrame, price_history_df: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Phase4 FINAL：TOP20 / Ranking 送入老師策略前補齊技術欄位。
+
+    老師策略不可只吃 ranking 分數，必須有 close / high / ma20 / ma60 / rsi / atr_pct /
+    price_deviation / volume_ratio / recent_high_1 / recent_high_2，否則低位階翻多與
+    兩高不過 Gate 會全部失真。
+    """
+    if df is None:
+        return df
+    x = df.copy()
+
+    def _num_col(col, default=np.nan):
+        if col in x.columns:
+            return pd.to_numeric(x[col], errors="coerce")
+        return pd.Series(default, index=x.index, dtype="float64")
+
+    # 若外部傳入 per-stock price_history_df，取每檔最後一筆補欄位。
+    if price_history_df is not None and isinstance(price_history_df, pd.DataFrame) and not price_history_df.empty and "stock_id" in price_history_df.columns and "stock_id" in x.columns:
+        try:
+            ph = price_history_df.copy()
+            if "date" in ph.columns:
+                ph = ph.sort_values(["stock_id", "date"])
+            last = ph.groupby("stock_id", as_index=False).tail(1).copy()
+            keep_cols = [c for c in ["stock_id", "close", "open", "high", "low", "volume", "ma5", "ma10", "ma20", "ma60", "rsi", "rsi14", "atr", "atr_pct", "price_dev", "price_deviation", "macd_hist", "volume_ratio", "recent_high_1", "recent_high_2", "prev_high"] if c in last.columns]
+            if len(keep_cols) > 1:
+                last = last[keep_cols].drop_duplicates("stock_id", keep="last")
+                drop_cols = [c for c in keep_cols if c != "stock_id" and c in x.columns and x[c].isna().all()]
+                if drop_cols:
+                    x = x.drop(columns=drop_cols, errors="ignore")
+                x = x.merge(last, on="stock_id", how="left", suffixes=("", "_ph"))
+                for c in keep_cols:
+                    if c == "stock_id":
+                        continue
+                    alt = f"{c}_ph"
+                    if alt in x.columns:
+                        if c in x.columns:
+                            x[c] = x[c].where(pd.notna(x[c]), x[alt])
+                            x = x.drop(columns=[alt], errors="ignore")
+                        else:
+                            x[c] = x[alt]
+                            x = x.drop(columns=[alt], errors="ignore")
+        except Exception as exc:
+            try:
+                log_warning(f"[TeacherStrategy] enrich input from price_history skipped: {exc}")
+            except Exception:
+                pass
+
+    if "close" not in x.columns and "現價" in x.columns:
+        x["close"] = pd.to_numeric(x["現價"], errors="coerce")
+    if "close" not in x.columns and "entry_mid" in x.columns:
+        x["close"] = pd.to_numeric(x["entry_mid"], errors="coerce")
+    if "rsi" not in x.columns and "rsi14" in x.columns:
+        x["rsi"] = pd.to_numeric(x["rsi14"], errors="coerce")
+    if "rsi14" not in x.columns and "rsi" in x.columns:
+        x["rsi14"] = pd.to_numeric(x["rsi"], errors="coerce")
+    if "price_deviation" not in x.columns and "price_dev" in x.columns:
+        x["price_deviation"] = pd.to_numeric(x["price_dev"], errors="coerce")
+    if "price_dev" not in x.columns and "price_deviation" in x.columns:
+        x["price_dev"] = pd.to_numeric(x["price_deviation"], errors="coerce")
+    if "atr_pct" not in x.columns and "atr" in x.columns and "close" in x.columns:
+        x["atr_pct"] = pd.to_numeric(x["atr"], errors="coerce") / pd.to_numeric(x["close"], errors="coerce").replace(0, np.nan)
+
+    # 安全預設：不是拿來假造交易，而是避免 engine 缺欄位崩潰；真正可交易仍由 Gate 控制。
+    for col, default in [
+        ("close", np.nan), ("high", np.nan), ("low", np.nan), ("open", np.nan),
+        ("ma20", np.nan), ("ma60", np.nan), ("rsi", 50.0), ("rsi14", 50.0),
+        ("atr_pct", 0.03), ("price_dev", 0.0), ("price_deviation", 0.0),
+        ("volume_ratio", 1.0), ("macd_hist", 0.0),
+        ("recent_high_1", 0.0), ("recent_high_2", 0.0), ("prev_high", 0.0),
+        ("flow_score", 50.0), ("rs_score", 50.0),
+    ]:
+        if col not in x.columns:
+            x[col] = default
+        else:
+            x[col] = pd.to_numeric(x[col], errors="coerce").fillna(default)
+    return x
+
+
 def apply_teacher_strategy_pipeline_safe(ranking_df, price_history_df=None, market_df=None, institutional_df=None, context: str = "", log_cb=None):
     """主程式固定 Teacher Strategy Hook。
     只呼叫 services.teacher_strategy_service，不在主程式內寫老師策略判斷邏輯。
@@ -358,14 +444,14 @@ def apply_teacher_strategy_pipeline_safe(ranking_df, price_history_df=None, mark
     """
     if ranking_df is None:
         return ranking_df
-    out = ranking_df.copy()
+    out = enrich_teacher_strategy_input_fields(ranking_df.copy(), price_history_df=price_history_df)
     defaults = _teacher_strategy_default_payload()
     try:
         if TeacherStrategyService is None:
             for col, default in defaults.items():
                 if col not in out.columns:
                     out[col] = default
-            return out
+            return finalize_teacher_strategy_fields(out)
         teacher_df = TeacherStrategyService().run(
             ranking_df=out,
             price_history_df=price_history_df,
@@ -2924,6 +3010,27 @@ class DBManager:
             ("kpattern_risk_flag", "kpattern_risk_flag TEXT DEFAULT 'NO'"),
             ("final_trade_score", "final_trade_score REAL DEFAULT 50"),
             ("kpattern_rank_adjustment", "kpattern_rank_adjustment REAL DEFAULT 0"),
+            ("close", "close REAL"),
+            ("open", "open REAL"),
+            ("high", "high REAL"),
+            ("low", "low REAL"),
+            ("volume", "volume REAL"),
+            ("ma5", "ma5 REAL"),
+            ("ma10", "ma10 REAL"),
+            ("ma20", "ma20 REAL"),
+            ("ma60", "ma60 REAL"),
+            ("rsi", "rsi REAL"),
+            ("rsi14", "rsi14 REAL"),
+            ("macd_hist", "macd_hist REAL"),
+            ("prev_close", "prev_close REAL"),
+            ("prev_high", "prev_high REAL"),
+            ("recent_high_1", "recent_high_1 REAL"),
+            ("recent_high_2", "recent_high_2 REAL"),
+            ("atr", "atr REAL"),
+            ("atr_pct", "atr_pct REAL"),
+            ("price_dev", "price_dev REAL"),
+            ("price_deviation", "price_deviation REAL"),
+            ("volume_ratio", "volume_ratio REAL DEFAULT 1"),
         ]:
             _add("ranking_result", col, ddl)
 
@@ -2945,6 +3052,14 @@ class DBManager:
             ("sector_strength_score", "sector_strength_score REAL DEFAULT 0"),
             ("flow_score", "flow_score REAL DEFAULT 0"),
             ("rs_score", "rs_score REAL DEFAULT 0"),
+            ("rotation_level", "rotation_level TEXT DEFAULT ''"),
+            ("low_base_type", "low_base_type TEXT DEFAULT '非低位階'"),
+            ("low_base_score", "low_base_score REAL DEFAULT 0"),
+            ("low_base_reason", "low_base_reason TEXT DEFAULT ''"),
+            ("teacher_strategy_score", "teacher_strategy_score REAL DEFAULT 0"),
+            ("teacher_rank", "teacher_rank INTEGER DEFAULT 9999"),
+            ("teacher_rank_seed", "teacher_rank_seed INTEGER DEFAULT 9999"),
+            ("teacher_block_reason", "teacher_block_reason TEXT DEFAULT ''"),
             ("teacher_buy_zone", "teacher_buy_zone TEXT DEFAULT ''"),
             ("teacher_stop_loss", "teacher_stop_loss TEXT DEFAULT ''"),
             ("teacher_target_price", "teacher_target_price TEXT DEFAULT ''"),
@@ -3027,6 +3142,14 @@ class DBManager:
             ("sector_strength_score", "sector_strength_score REAL DEFAULT 0"),
             ("flow_score", "flow_score REAL DEFAULT 0"),
             ("rs_score", "rs_score REAL DEFAULT 0"),
+            ("rotation_level", "rotation_level TEXT DEFAULT ''"),
+            ("low_base_type", "low_base_type TEXT DEFAULT '非低位階'"),
+            ("low_base_score", "low_base_score REAL DEFAULT 0"),
+            ("low_base_reason", "low_base_reason TEXT DEFAULT ''"),
+            ("teacher_strategy_score", "teacher_strategy_score REAL DEFAULT 0"),
+            ("teacher_rank", "teacher_rank INTEGER DEFAULT 9999"),
+            ("teacher_rank_seed", "teacher_rank_seed INTEGER DEFAULT 9999"),
+            ("teacher_block_reason", "teacher_block_reason TEXT DEFAULT ''"),
             ("teacher_buy_zone", "teacher_buy_zone TEXT DEFAULT ''"),
             ("teacher_stop_loss", "teacher_stop_loss TEXT DEFAULT ''"),
             ("teacher_target_price", "teacher_target_price TEXT DEFAULT ''"),
@@ -3849,6 +3972,12 @@ class RankingEngine:
             hist = DataEngine.attach(hist)
             hist = apply_kpattern_pipeline_safe(hist, price_history=hist, context=f"ranking:{stock_id}")
             kpattern_payload = _extract_kpattern_payload(hist)
+            last_tech = hist.iloc[-1].to_dict() if hist is not None and not hist.empty else {}
+            prev_tech = hist.iloc[-2].to_dict() if hist is not None and len(hist) >= 2 else last_tech
+            try:
+                recent_highs = hist["high"].tail(60).dropna().sort_values(ascending=False).head(2).tolist() if "high" in hist.columns else []
+            except Exception:
+                recent_highs = []
             score = StrategyEngineV91.score(hist)
             technical_total = float(score.get("total_score", 0) or 0)
             feat = feature_map.get(stock_id, {})
@@ -3874,10 +4003,44 @@ class RankingEngine:
                 score[c] = feat.get(c, np.nan if c in ["eps_ttm", "eps_yoy", "revenue_yoy", "matrix_base_score", "modifier", "revenue_eps_score"] else "")
             for c, v in kpattern_payload.items():
                 score[c] = v
+            # Phase4 FINAL：老師策略需要真實技術欄位；Ranking 寫入時同步保存，避免 UI 老師策略全為未知/0分。
+            indicator_payload = {
+                "close": last_tech.get("close", np.nan),
+                "open": last_tech.get("open", np.nan),
+                "high": last_tech.get("high", np.nan),
+                "low": last_tech.get("low", np.nan),
+                "volume": last_tech.get("volume", np.nan),
+                "ma5": last_tech.get("ma5", np.nan),
+                "ma10": last_tech.get("ma10", np.nan),
+                "ma20": last_tech.get("ma20", np.nan),
+                "ma60": last_tech.get("ma60", np.nan),
+                "rsi": last_tech.get("rsi14", np.nan),
+                "rsi14": last_tech.get("rsi14", np.nan),
+                "macd_hist": last_tech.get("macd_hist", np.nan),
+                "prev_close": prev_tech.get("close", np.nan),
+                "prev_high": prev_tech.get("high", np.nan),
+                "recent_high_1": recent_highs[0] if len(recent_highs) >= 1 else prev_tech.get("high", np.nan),
+                "recent_high_2": recent_highs[1] if len(recent_highs) >= 2 else np.nan,
+            }
+            try:
+                close_v = float(indicator_payload.get("close") or 0)
+                ma20_v = float(indicator_payload.get("ma20") or 0)
+                high_v = float(indicator_payload.get("high") or 0)
+                low_v = float(indicator_payload.get("low") or 0)
+                atr_v = abs(high_v - low_v) if high_v and low_v else 0.0
+                indicator_payload["atr"] = atr_v
+                indicator_payload["atr_pct"] = atr_v / close_v if close_v else 0.03
+                indicator_payload["price_dev"] = (close_v / ma20_v - 1.0) if close_v and ma20_v else 0.0
+                indicator_payload["price_deviation"] = indicator_payload["price_dev"]
+                vol_ma20 = pd.to_numeric(hist["volume"].tail(20), errors="coerce").mean() if "volume" in hist.columns else np.nan
+                indicator_payload["volume_ratio"] = float(last_tech.get("volume", 0) or 0) / vol_ma20 if vol_ma20 and not np.isnan(vol_ma20) else 1.0
+            except Exception:
+                indicator_payload.update({"atr": np.nan, "atr_pct": 0.03, "price_dev": 0.0, "price_deviation": 0.0, "volume_ratio": 1.0})
             rows.append({
                 "date": today,
                 "stock_id": stock_id,
                 **score,
+                **indicator_payload,
                 "rank_all": 0,
                 "rank_industry": 0
             })
