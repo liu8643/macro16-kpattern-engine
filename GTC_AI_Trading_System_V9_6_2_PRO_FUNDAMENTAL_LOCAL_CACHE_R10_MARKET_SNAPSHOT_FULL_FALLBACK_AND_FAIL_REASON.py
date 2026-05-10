@@ -657,11 +657,6 @@ CLASSIFICATION_V2_UNCLASSIFIED_PATH = CLASSIFICATION_CACHE_DIR / "未匹配分�
 CLASSIFICATION_V2_LAST_SUMMARY = {}
 CLASSIFICATION_V2_SUMMARY_HISTORY = []
 CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS = 500
-# V17.1 CLASSIFICATION_SUMMARY_FIX：
-# 分類流程會在不同範圍重複執行（全市場來源、主檔、UI runtime）。
-# UI 右側狀態只能顯示「有效主檔 / runtime」統計，不可被全市場來源掃描的舊 summary 污染。
-CLASSIFICATION_UI_SUMMARY_SCOPES = {"active_master", "ui_runtime", "runtime_master"}
-CLASSIFICATION_NON_UI_SUMMARY_SCOPES = {"full_market", "source_probe", "official_source"}
 
 CLASSIFICATION_LOG_CALLBACK = None
 CLASSIFICATION_STABILITY_LOCK = threading.RLock()
@@ -720,68 +715,14 @@ def _append_classification_summary_history(summary: dict, promoted: bool = False
     except Exception:
         pass
 
-def _classification_summary_scope(summary: dict) -> str:
-    try:
-        return str((summary or {}).get("source_scope", "") or "").strip()
-    except Exception:
-        return ""
-
-
-def _classification_summary_is_ui_eligible(summary: dict) -> bool:
-    """V17.1：判斷 summary 是否可作為 UI 右側分類狀態。
-    避免 full_market/source_probe 的低覆蓋率舊統計覆蓋 active_master 的 100% 統計。
-    """
-    if not isinstance(summary, dict) or not summary:
-        return False
-    total = int(summary.get("total", 0) or 0)
-    if total < CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS:
-        return False
-    scope = _classification_summary_scope(summary)
-    if scope in CLASSIFICATION_UI_SUMMARY_SCOPES:
-        return True
-    if scope in CLASSIFICATION_NON_UI_SUMMARY_SCOPES:
-        return False
-    # 舊 summary 沒有 source_scope 時，保守允許；但排序會低於 active_master/ui_runtime。
-    return True
-
-
-def _infer_classification_summary_scope(total: int, unclassified_count: int = 0, df: pd.DataFrame | None = None) -> str:
-    """依資料規模推估本次分類統計的用途。
-    目前官方上市+上櫃全市場約 1900+，有效操作主檔約 900~1200。
-    """
-    try:
-        total = int(total or 0)
-    except Exception:
-        total = 0
-    if total >= 1500:
-        return "full_market"
-    if total >= CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS:
-        return "active_master"
-    if total > 0:
-        return "ui_runtime"
-    return "empty"
-
-
 def _summary_sort_key(summary: dict) -> tuple:
     if not isinstance(summary, dict):
-        return (0, -1, -1.0, -1, "")
+        return (-1, -1, -1.0, "")
     total = int(summary.get("total", 0) or 0)
     covered = int(summary.get("covered", 0) or 0)
     coverage = float(summary.get("coverage_pct", 0) or 0.0)
     report_time = str(summary.get("report_time", "") or "")
-    scope = _classification_summary_scope(summary)
-    if scope in ("active_master", "ui_runtime", "runtime_master"):
-        scope_rank = 3
-    elif scope == "":
-        scope_rank = 2
-    elif scope in ("full_market", "source_probe", "official_source"):
-        scope_rank = 1
-    else:
-        scope_rank = 0
-    eligible = 1 if _classification_summary_is_ui_eligible(summary) else 0
-    # UI summary 選擇優先順序：可顯示性 > scope > 覆蓋率 > 已覆蓋數 > 時間
-    return (eligible, scope_rank, coverage, covered, report_time)
-
+    return (total, covered, coverage, report_time)
 
 def _pick_best_classification_summary(*candidates) -> dict:
     valid = []
@@ -792,12 +733,9 @@ def _pick_best_classification_summary(*candidates) -> dict:
         return {}
     return max(valid, key=_summary_sort_key)
 
-
 def _should_promote_classification_summary(summary: dict) -> bool:
-    """V17.1：只允許有效主檔 / runtime summary 晉升為 UI/JSON 主要 summary。
-    full_market/source_probe 只可進 history，不可覆蓋 UI 顯示。
-    """
-    if not _classification_summary_is_ui_eligible(summary):
+    total = int(summary.get("total", 0) or 0)
+    if total < CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS:
         return False
     current = {}
     try:
@@ -811,7 +749,6 @@ def _should_promote_classification_summary(summary: dict) -> bool:
     if not best:
         return True
     return _summary_sort_key(summary) >= _summary_sort_key(best)
-
 
 def _get_cached_official_classification(market: str = "ALL", path: Path | None = None) -> Optional[pd.DataFrame]:
     market = str(market or "ALL").strip() or "ALL"
@@ -1559,12 +1496,12 @@ def _safe_int(v, default: int = 0) -> int:
 
 
 def _is_placeholder_text(v) -> bool:
-    return str(v or "").strip() in ("", "未分類", "全市場", "系統掃描", "其他", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
+    return str(v or "").strip() in ("", "未分類", "全市場", "系統掃描", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
 
 
 def _is_missing_classification_value(v) -> bool:
     s = str(v or "").strip()
-    return s in ("", "未分類", "全市場", "系統掃描", "其他", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
+    return s in ("", "未分類", "全市場", "系統掃描", "nan", "None", "<NA>", "N/A", "NaN", "null", "NULL")
 
 
 def _choose_text(*values, default: str = "") -> str:
@@ -1611,31 +1548,16 @@ def _write_unclassified_report(df: pd.DataFrame):
 
 
 def get_classification_v2_summary() -> dict:
-    """V17.1：取得 UI 右側應顯示的分類統計。
-    優先順序：
-    1) active_master / ui_runtime / runtime_master 且 total >= 門檻
-    2) 若沒有，才回退舊 summary
-    """
     global CLASSIFICATION_V2_LAST_SUMMARY
-    candidates = []
+    file_data = {}
     try:
         if CLASSIFICATION_V2_SUMMARY_PATH.exists():
             raw = json.loads(CLASSIFICATION_V2_SUMMARY_PATH.read_text(encoding='utf-8'))
             if isinstance(raw, dict):
-                candidates.append(dict(raw))
+                file_data = dict(raw)
     except Exception:
-        pass
-    if isinstance(CLASSIFICATION_V2_LAST_SUMMARY, dict) and CLASSIFICATION_V2_LAST_SUMMARY:
-        candidates.append(dict(CLASSIFICATION_V2_LAST_SUMMARY))
-    try:
-        for item in list(CLASSIFICATION_V2_SUMMARY_HISTORY or [])[-20:]:
-            if isinstance(item, dict) and item:
-                candidates.append(dict(item))
-    except Exception:
-        pass
-
-    ui_candidates = [c for c in candidates if _classification_summary_is_ui_eligible(c)]
-    best = _pick_best_classification_summary(*(ui_candidates or candidates))
+        file_data = {}
+    best = _pick_best_classification_summary(file_data, CLASSIFICATION_V2_LAST_SUMMARY)
     if best:
         CLASSIFICATION_V2_LAST_SUMMARY = dict(best)
         return dict(best)
@@ -1647,6 +1569,10 @@ def infer_ai_classification(stock_name: str, industry_hint: str = "", market_hin
     market_hint = str(market_hint or "").strip()
     if int(is_etf or 0) == 1 or re.search(r"ETF|台灣50|高股息|中型100|科技優息|精選高息", name, flags=re.I):
         return ("ETF", "ETF", "ETF", "ai_infer", 98, "ETF keyword")
+
+    # REIT / ETN / 指數投資證券等非普通股，不應被列入「未匹配分類」污染覆蓋率。
+    if re.search(r"(R\d+|N)$", name, flags=re.I) or re.search(r"REIT|ETN|指數投資證券|不動產投資信託", name, flags=re.I):
+        return ("金融商品", "REIT/ETN", "金融商品", "ai_infer", 88, "REIT/ETN keyword")
 
     ai_rules = [
         (r"華星光|上詮|聯鈞|波若威|光聖|聯亞|眾達|前鼎|立碁|環宇|光環|聯光通|眾達-KY", ("光通訊", "CPO/光模組", "高速光通訊", 94, "光通訊/CPO keyword")),
@@ -1677,15 +1603,12 @@ def infer_ai_classification(stock_name: str, industry_hint: str = "", market_hin
 
 
 
-def build_classification_quality_report(df: pd.DataFrame, source_scope: str | None = None) -> tuple[pd.DataFrame, dict]:
+def build_classification_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     global CLASSIFICATION_V2_LAST_SUMMARY
     if df is None or df.empty:
-        scope = source_scope or "empty"
         summary = {
             "total": 0, "official": 0, "manual": 0, "rule_engine": 0, "ai_infer": 0,
             "unclassified": 0, "covered": 0, "coverage_pct": 0.0,
-            "source_scope": scope,
-            "ui_display_eligible": False,
             "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         best = _pick_best_classification_summary(CLASSIFICATION_V2_LAST_SUMMARY, summary)
@@ -1704,18 +1627,17 @@ def build_classification_quality_report(df: pd.DataFrame, source_scope: str | No
         x[col] = _safe_text_series(x[col], "")
     x["classification_confidence"] = pd.to_numeric(x["classification_confidence"], errors="coerce").fillna(0)
 
-    unclassified_mask = (
-        x["industry_final"].map(_is_missing_classification_value) |
-        x["theme_final"].map(_is_missing_classification_value) |
-        x["sub_theme_final"].map(_is_missing_classification_value)
-    )
+    # V17.1 CLASSIFICATION_SUMMARY_FIX:
+    # 覆蓋率應以「產業分類是否成功」為主，不能把已取得官方產業但題材仍為
+    #「全市場 / 系統掃描」的股票誤列為未匹配；否則會出現官方分類已載入，
+    # 但 UI 覆蓋率仍偏低的假象。
+    unclassified_mask = x["industry_final"].map(_is_missing_classification_value)
     unclassified = x.loc[unclassified_mask, ["stock_id", "stock_name", "market", "industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]].copy().sort_values(["classification_source", "stock_id"])
 
     source_counts = x["classification_source"].astype(str).value_counts().to_dict()
     total = int(len(x))
     unclassified_count = int(unclassified_mask.sum())
     covered = max(total - unclassified_count, 0)
-    scope = source_scope or _infer_classification_summary_scope(total, unclassified_count, x)
     summary = {
         "total": total,
         "official": int(source_counts.get("official", 0)),
@@ -1725,8 +1647,6 @@ def build_classification_quality_report(df: pd.DataFrame, source_scope: str | No
         "unclassified": unclassified_count,
         "covered": covered,
         "coverage_pct": round((covered / total * 100.0), 2) if total else 0.0,
-        "source_scope": scope,
-        "ui_display_eligible": bool(scope in CLASSIFICATION_UI_SUMMARY_SCOPES and total >= CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS),
         "report_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "unclassified_report": str(CLASSIFICATION_V2_UNCLASSIFIED_PATH),
     }
@@ -1735,14 +1655,13 @@ def build_classification_quality_report(df: pd.DataFrame, source_scope: str | No
     if promoted:
         CLASSIFICATION_V2_LAST_SUMMARY = dict(summary)
         _write_json_safe(CLASSIFICATION_V2_SUMMARY_PATH, summary)
-        _write_unclassified_report(unclassified)
     else:
-        # 非 UI 範圍（例如 full_market）不覆蓋 JSON / 未匹配清單，避免 UI 顯示舊的 88.27%。
         best = _pick_best_classification_summary(CLASSIFICATION_V2_LAST_SUMMARY, get_classification_v2_summary())
         if best:
             CLASSIFICATION_V2_LAST_SUMMARY = dict(best)
 
     _append_classification_summary_history(summary, promoted=promoted)
+    _write_unclassified_report(unclassified)
 
     coverage = 1.0 - float(x["industry_final"].isin(["未分類", "未匹配"]).mean()) if len(x) else 0.0
     if coverage < 0.95:
@@ -1826,6 +1745,10 @@ OFFICIAL_INDUSTRY_ALIAS_MAP = {
 }
 
 INDUSTRY_THEME_MAP = {
+    "水泥工業": ("水泥工業", "傳產", "水泥"),
+    "其他": ("其他", "其他", "其他"),
+    "未分類": ("未分類", "全市場", "系統掃描"),
+    "金融商品": ("金融商品", "REIT/ETN", "金融商品"),
     "食品工業": ("食品工業", "民生消費", "食品"),
     "塑膠工業": ("塑膠工業", "基礎原物料", "塑膠"),
     "紡織纖維": ("紡織纖維", "傳產", "紡織"),
@@ -1878,6 +1801,8 @@ def infer_theme_bundle(stock_name: str, industry: str, is_etf: int) -> Tuple[str
     industry = normalize_official_industry_name(str(industry or "").strip())
     if int(is_etf or 0) == 1 or re.search(r"ETF|台灣50|高股息|中型100|科技優息|精選高息", name):
         return "ETF", "ETF", "ETF"
+    if re.search(r"(R\d+|N)$", name, flags=re.I) or re.search(r"REIT|ETN|指數投資證券|不動產投資信託", name, flags=re.I):
+        return "金融商品", "REIT/ETN", "金融商品"
     for pattern, bundle in THEME_RULES:
         if re.search(pattern, name):
             return bundle
@@ -1897,7 +1822,7 @@ def infer_theme_bundle(stock_name: str, industry: str, is_etf: int) -> Tuple[str
 
 
 
-def apply_classification_layers(df: pd.DataFrame, source_scope: str | None = None) -> pd.DataFrame:
+def apply_classification_layers(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy().fillna("")
     x = _ensure_object_columns(x, [
         "stock_id", "stock_name", "market", "industry", "theme", "sub_theme",
@@ -2098,13 +2023,24 @@ def apply_classification_layers(df: pd.DataFrame, source_scope: str | None = Non
     x["sub_theme_final"] = _safe_text_series(x["sub_theme_final"], "系統掃描").replace("", "系統掃描")
     x.loc[x["is_etf"].eq(1), ["industry_final", "theme_final", "sub_theme_final", "classification_source", "classification_confidence", "classification_note"]] = ["ETF", "ETF", "ETF", "manual", 98, "ETF normalized"]
 
+    # V17.1：最後一層補題材，避免官方產業已命中但 theme/sub_theme 仍停在全市場/系統掃描。
+    try:
+        _mapped = x["industry_final"].map(lambda s: INDUSTRY_THEME_MAP.get(normalize_official_industry_name(s), ("", "", "")))
+        _mapped_df = pd.DataFrame(_mapped.tolist(), columns=["_ind2", "_theme2", "_sub2"], index=x.index)
+        _miss_theme2 = x["theme_final"].map(_is_missing_classification_value)
+        _miss_sub2 = x["sub_theme_final"].map(_is_missing_classification_value)
+        x.loc[_miss_theme2 & _mapped_df["_theme2"].astype(str).ne(""), "theme_final"] = _mapped_df.loc[_miss_theme2 & _mapped_df["_theme2"].astype(str).ne(""), "_theme2"].values
+        x.loc[_miss_sub2 & _mapped_df["_sub2"].astype(str).ne(""), "sub_theme_final"] = _mapped_df.loc[_miss_sub2 & _mapped_df["_sub2"].astype(str).ne(""), "_sub2"].values
+    except Exception:
+        pass
+
     x["industry"] = _safe_text_series(x["industry_final"], "未分類")
     x["theme"] = _safe_text_series(x["theme_final"], "全市場")
     x["sub_theme"] = _safe_text_series(x["sub_theme_final"], "系統掃描")
     x["is_active"] = 1
     x["update_date"] = datetime.now().strftime("%Y-%m-%d")
 
-    _, summary = build_classification_quality_report(x, source_scope=source_scope)
+    _, summary = build_classification_quality_report(x)
     try:
         classification_debug_log(f"V2 覆蓋率 {summary.get('coverage_pct', 0):.2f}%｜官方 {summary.get('official', 0)}｜手動 {summary.get('manual', 0)}｜規則 {summary.get('rule_engine', 0)}｜AI {summary.get('ai_infer', 0)}｜未分類 {summary.get('unclassified', 0)}")
     except Exception:
@@ -2316,11 +2252,11 @@ def _normalize_master_df(df: pd.DataFrame, market_label: str, persist_classifica
         original_threshold = CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS
         try:
             globals()["CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS"] = max(int(CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS), len(x) + 1)
-            x = apply_classification_layers(x, source_scope="source_probe")
+            x = apply_classification_layers(x)
         finally:
             globals()["CLASSIFICATION_SUMMARY_PROMOTION_MIN_ROWS"] = original_threshold
     else:
-        x = apply_classification_layers(x, source_scope=("source_probe" if not persist_classification_summary else "active_master"))
+        x = apply_classification_layers(x)
     return x[["stock_id", "stock_name", "market", "industry", "theme", "sub_theme", "is_etf", "is_active", "update_date"]].drop_duplicates(subset=["stock_id"]).reset_index(drop=True)
 
 def fetch_twse_universe() -> pd.DataFrame:
