@@ -5,12 +5,13 @@ from .rotation_filter_engine import RotationFilterEngine
 
 class TeacherStrategyEngine:
     """
-    顧奎國老師策略主引擎
+    顧奎國老師策略主引擎 V3
 
-    原則：
-    1. UI 不計算策略，只讀本引擎輸出
-    2. 主程式只 Hook / run / merge / display / export
-    3. 本引擎整合：位階、兩高不過、類股輪動、資金/RS/RR
+    功能：
+    1. 接 position_stage_engine.py 的位階判斷
+    2. 接 two_high_fail_engine.py 的弱勢排除 Gate
+    3. 接 rotation_filter_engine.py 的類股輪動
+    4. 產出 UI / Excel / DB 可直接使用的 teacher_result
     """
 
     def __init__(self):
@@ -76,7 +77,11 @@ class TeacherStrategyEngine:
         stock_id = self._text(row, "stock_id")
         stock_name = self._text(row, "stock_name")
 
+        # =========================
+        # 1. 位階判斷
+        # =========================
         position_result = self.position_engine.analyze(row)
+
         if isinstance(position_result, dict):
             position_stage = position_result.get("position_stage", "未知")
             position_score = self._num(position_result, "position_score", 0)
@@ -86,10 +91,27 @@ class TeacherStrategyEngine:
             position_score = 50
             position_reason = ""
 
-        two_high_fail = self.two_high_engine.analyze(row)
-        two_high_fail = bool(two_high_fail)
+        # =========================
+        # 2. 兩高不過 / 弱勢排除 Gate
+        # =========================
+        two_high_result = self.two_high_engine.analyze(row)
 
+        if isinstance(two_high_result, dict):
+            two_high_fail = bool(two_high_result.get("two_high_fail", False))
+            weak_gate = two_high_result.get("weak_gate", "PASS")
+            weak_score = self._num(two_high_result, "weak_score", 0)
+            weak_reason = two_high_result.get("weak_reason", "")
+        else:
+            two_high_fail = bool(two_high_result)
+            weak_gate = "BLOCK" if two_high_fail else "PASS"
+            weak_score = 100 if two_high_fail else 0
+            weak_reason = "兩高不過成立" if two_high_fail else ""
+
+        # =========================
+        # 3. 類股輪動
+        # =========================
         rotation_result = self.rotation_engine.analyze(row)
+
         if isinstance(rotation_result, dict):
             rotation = rotation_result.get("rotation", "未知")
             sector_strength_score = self._num(rotation_result, "sector_strength_score", 0)
@@ -99,6 +121,9 @@ class TeacherStrategyEngine:
             sector_strength_score = self._num(row, "sector_strength", 0)
             rotation_reason = ""
 
+        # =========================
+        # 4. 資金 / RS / RR / 風險資料
+        # =========================
         flow_score = self._num(row, "flow_score", self._num(row, "institutional_score", 50))
         rs_score = self._num(row, "rs_score", self._num(row, "relative_strength_score", 50))
         rr = self._num(row, "rr_live", self._num(row, "rr", 0))
@@ -112,90 +137,128 @@ class TeacherStrategyEngine:
         teacher_light = "🔵"
         reason_parts = []
 
-        # 1. 強制排除：兩高不過
-        if two_high_fail:
+        # =========================
+        # 5. 老師策略決策邏輯
+        # =========================
+
+        # A. 強制排除：弱勢 Gate
+        if weak_gate == "BLOCK" or two_high_fail:
             teacher_strategy_class = "排除"
             teacher_final_decision = "AVOID"
             teacher_light = "🔴"
-            reason_parts.append("兩高不過成立，弱勢反彈或壓力未突破，不得進今日可買")
+            reason_parts.append("弱勢排除Gate成立，兩高不過/假突破/高檔爆量不漲，不得進今日可買")
 
-        # 2. 高位階過熱：不追
+        # B. 高位階過熱：不追
         elif position_stage == "高位階過熱" or price_dev >= 0.20 or rsi >= 78:
             teacher_strategy_class = "排除"
             teacher_final_decision = "REDUCE"
             teacher_light = "🔴"
             reason_parts.append("高位階過熱或乖離過大，禁止追高，偏減碼或避開")
 
-        # 3. 主升3浪：主攻
-        elif position_stage == "主升3浪" and sector_strength_score >= 70 and flow_score >= 50 and rs_score >= 55:
+        # C. 主升3浪：主攻
+        elif (
+            position_stage == "主升3浪"
+            and sector_strength_score >= 70
+            and flow_score >= 50
+            and rs_score >= 55
+        ):
             teacher_strategy_class = "主攻"
             teacher_final_decision = "BUY"
             teacher_light = "🟢"
             reason_parts.append("主升3浪 + 類股強 + 資金/RS支撐，列入老師策略主攻")
 
-        # 4. 主升初段 / 低位階翻多：低接
+        # D. 主升初段 / 低位階翻多：低接
         elif position_stage in ("主升初段", "低位階翻多") and sector_strength_score >= 55:
             teacher_strategy_class = "低接"
             teacher_final_decision = "LOW BUY"
             teacher_light = "🟢"
             reason_parts.append("低位階翻多或主升初段，適合拉回低接與卡位")
 
-        # 5. 中位階整理：等拉回
+        # E. 中位階整理：等拉回
         elif position_stage == "中位階整理" and rs_score >= 50:
             teacher_strategy_class = "等拉回"
             teacher_final_decision = "WAIT_PULLBACK"
             teacher_light = "🟡"
-            reason_parts.append("中位階整理且相對強弱尚可，但不追價，等待拉回")
+            reason_parts.append("中位階整理且相對強弱尚可，不追價，等待拉回")
 
-        # 6. ABC修正：觀察
+        # F. ABC修正：觀察
         elif position_stage == "ABC修正待確認":
             teacher_strategy_class = "觀察"
             teacher_final_decision = "WATCH"
             teacher_light = "🔵"
             reason_parts.append("可能為ABC修正或修正末端，需等待止跌K棒確認")
 
-        # 7. 修正段：避開
+        # G. 修正段：避開
         elif position_stage == "修正段":
             teacher_strategy_class = "排除"
             teacher_final_decision = "AVOID"
             teacher_light = "🔴"
             reason_parts.append("股價結構偏弱，屬修正段，不主動進場")
 
+        # H. 弱勢警告：降級觀察
+        elif weak_gate == "WARNING":
+            teacher_strategy_class = "觀察"
+            teacher_final_decision = "WATCH"
+            teacher_light = "🔵"
+            reason_parts.append("弱勢Gate警告，先列觀察，不列今日可買")
+
+        # I. 其他
         else:
             teacher_strategy_class = "觀察"
             teacher_final_decision = "WATCH"
             teacher_light = "🔵"
             reason_parts.append("條件尚未形成主攻或低接，列觀察")
 
+        # =========================
+        # 6. RR 風控降級
+        # =========================
         if rr and rr < 1.0 and teacher_final_decision in ("BUY", "LOW BUY"):
             teacher_final_decision = "WATCH"
             teacher_light = "🔵"
             teacher_strategy_class = "觀察"
             reason_parts.append("RR低於1，主攻/低接降級為觀察")
 
+        # =========================
+        # 7. 補充理由
+        # =========================
         if position_reason:
             reason_parts.append(position_reason)
+
+        if weak_reason:
+            reason_parts.append(weak_reason)
 
         if rotation_reason:
             reason_parts.append(rotation_reason)
 
+        # =========================
+        # 8. 統一輸出 teacher_result
+        # =========================
         result["stock_id"] = stock_id
         result["stock_name"] = stock_name
+
         result["teacher_strategy_class"] = teacher_strategy_class
         result["teacher_final_decision"] = teacher_final_decision
         result["teacher_light"] = teacher_light
+        result["teacher_gate"] = self._calc_gate(teacher_final_decision)
+
         result["position_stage"] = position_stage
         result["position_score"] = round(position_score, 2)
+
         result["two_high_fail"] = two_high_fail
+        result["weak_gate"] = weak_gate
+        result["weak_score"] = round(weak_score, 2)
+
         result["rotation"] = rotation
         result["sector_strength_score"] = round(sector_strength_score, 2)
+
         result["flow_score"] = round(flow_score, 2)
         result["rs_score"] = round(rs_score, 2)
+
         result["teacher_buy_zone"] = teacher_buy_zone
         result["teacher_stop_loss"] = teacher_stop_loss
         result["teacher_target_price"] = teacher_target_price
+
         result["teacher_reason"] = "；".join(reason_parts)
-        result["teacher_gate"] = self._calc_gate(teacher_final_decision)
-        result["teacher_source"] = "teacher_strategy_engine_v2"
+        result["teacher_source"] = "teacher_strategy_engine_v3_weak_gate"
 
         return result
