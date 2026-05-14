@@ -10,32 +10,51 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout source
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        shell: cmd
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy openpyxl requests beautifulsoup4 lxml matplotlib yfinance pyinstaller
 
-      - name: Install PyInstaller
-        run: pip install pyinstaller
+      - name: Verify project files
+        shell: cmd
+        run: |
+          dir
+          dir services
+          dir teacher_strategy
+          dir kpattern_module
 
       - name: Build EXE
+        shell: cmd
         run: |
           pyinstaller --onefile --console ^
-          --hidden-import=services ^
-          --hidden-import=services.kpattern_service ^
-          --hidden-import=kpattern_module ^
-          --hidden-import=kpattern_module.kpattern_pipeline ^
-          --hidden-import=kpattern_module.kpattern_feature_engine ^
-          --hidden-import=kpattern_module.sakata_pattern_engine ^
-          --hidden-import=kpattern_module.pattern_position_engine ^
-          --hidden-import=kpattern_module.pattern_score_engine ^
-          --hidden-import=kpattern_module.volume_confirm_engine ^
-          --hidden-import=kpattern_module.decision_layer_engine ^
-          GTC_AI_Trading_System_V9_6_2_PRO_FUNDAMENTAL_LOCAL_CACHE_R10_MARKET_SNAPSHOT_FULL_FALLBACK_AND_FAIL_REASON.py
+            --name GTC_AI_Trading_System_V17_R3 ^
+            --hidden-import=services ^
+            --hidden-import=services.kpattern_service ^
+            --hidden-import=services.teacher_strategy_service ^
+            --hidden-import=teacher_strategy ^
+            --hidden-import=teacher_strategy.position_stage_engine ^
+            --hidden-import=teacher_strategy.two_high_fail_engine ^
+            --hidden-import=teacher_strategy.rotation_filter_engine ^
+            --hidden-import=teacher_strategy.low_base_reversal_engine ^
+            --hidden-import=teacher_strategy.teacher_strategy_engine ^
+            --hidden-import=kpattern_module ^
+            --hidden-import=kpattern_module.kpattern_pipeline ^
+            --hidden-import=kpattern_module.kpattern_feature_engine ^
+            --hidden-import=kpattern_module.sakata_pattern_engine ^
+            --hidden-import=kpattern_module.pattern_position_engine ^
+            --hidden-import=kpattern_module.pattern_score_engine ^
+            --hidden-import=kpattern_module.volume_confirm_engine ^
+            --hidden-import=kpattern_module.decision_layer_engine ^
+            GTC_AI_Trading_System_V9_6_2_PRO_FUNDAMENTAL_LOCAL_CACHE_R10_MARKET_SNAPSHOT_FULL_FALLBACK_AND_FAIL_REASON.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
