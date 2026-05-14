@@ -352,16 +352,18 @@ def apply_teacher_strategy_pipeline_safe(ranking_df, price_history_df=None, mark
         )
         if teacher_df is not None and isinstance(teacher_df, pd.DataFrame) and not teacher_df.empty:
             if "stock_id" in teacher_df.columns and "stock_id" in out.columns:
-                teacher_df = teacher_df.drop_duplicates(subset=["stock_id"], keep="last")
+                teacher_df = normalize_teacher_merge_context_columns(teacher_df)
                 # 避免重複欄位造成 _x/_y 污染；老師策略欄位以最新 service 結果為準。
                 drop_cols = [c for c in TEACHER_STRATEGY_COLUMNS if c in out.columns]
                 if drop_cols:
                     out = out.drop(columns=drop_cols, errors="ignore")
-                out = out.merge(teacher_df, on="stock_id", how="left")
+                out = out.merge(teacher_df, on="stock_id", how="left", suffixes=("", "_teacher"))
+                out = normalize_ranking_result_columns(out)
             else:
                 for col in teacher_df.columns:
                     if col not in out.columns and len(teacher_df[col]) == len(out):
                         out[col] = teacher_df[col].values
+                out = normalize_ranking_result_columns(out)
         for col, default in defaults.items():
             if col not in out.columns:
                 out[col] = default
@@ -388,6 +390,82 @@ def apply_teacher_strategy_pipeline_safe(ranking_df, price_history_df=None, mark
             if col not in out.columns:
                 out[col] = default
         return out
+
+
+# V17-R4 DAILY_UPDATE_SCHEMA_GUARD：避免 pandas merge 產生的 date_x/date_y 污染 DB 寫入。
+def normalize_ranking_result_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """寫入 ranking_result 前的欄位正規化。
+
+    修正重點：
+    1) pandas merge 產生 date_x / date_y 時，統一回正式欄位 date。
+    2) date_x / date_y 不屬於正式 schema，必須移除。
+    3) 其他 *_x / *_y 欄位若是 merge 副產品，優先保留原欄位，避免寫 DB 失敗。
+    """
+    if df is None:
+        return df
+    x = df.copy()
+
+    if "date" not in x.columns:
+        if "date_x" in x.columns:
+            x["date"] = x["date_x"]
+        elif "date_y" in x.columns:
+            x["date"] = x["date_y"]
+
+    for c in ["date_x", "date_y"]:
+        if c in x.columns:
+            x = x.drop(columns=[c])
+
+    # 清理其他 pandas merge suffix 欄位：若 base 欄位已存在，直接丟棄；若 base 不存在，回填為 base。
+    suffix_cols = [c for c in list(x.columns) if isinstance(c, str) and (c.endswith("_x") or c.endswith("_y"))]
+    for c in suffix_cols:
+        base = c[:-2]
+        if base in x.columns:
+            x = x.drop(columns=[c])
+        else:
+            x = x.rename(columns={c: base})
+    return x
+
+
+def filter_df_to_table_schema(conn, df: pd.DataFrame, table_name: str, log_prefix: str = "DB_SCHEMA_GUARD") -> pd.DataFrame:
+    """依 SQLite 既有 schema 白名單過濾 DataFrame 欄位，避免未知欄位導致 INSERT 失敗。"""
+    if df is None:
+        return df
+    x = df.copy()
+    try:
+        safe_table = re.sub(r"[^A-Za-z0-9_]", "", str(table_name or ""))
+        if not safe_table:
+            return x
+        cur = conn.cursor()
+        cur.execute(f"PRAGMA table_info({safe_table})")
+        table_cols = [str(r[1]) for r in cur.fetchall()]
+        if not table_cols:
+            return x
+        keep_cols = [c for c in x.columns if c in table_cols]
+        dropped = [c for c in x.columns if c not in table_cols]
+        if dropped:
+            try:
+                log_warning(f"[{log_prefix}] {safe_table} drop non-schema columns before insert: {dropped}")
+            except Exception:
+                pass
+        return x[keep_cols]
+    except Exception as exc:
+        try:
+            log_warning(f"[{log_prefix}] schema filter failed for {table_name}: {exc}")
+        except Exception:
+            pass
+        return x
+
+
+def normalize_teacher_merge_context_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """TeacherStrategy 回傳資料只允許老師策略欄位進入排名表，避免 rank context 的 date_x/date_y 污染 ranking_result。"""
+    if df is None:
+        return df
+    x = normalize_ranking_result_columns(df.copy())
+    if "stock_id" not in x.columns:
+        return x
+    allowed = ["stock_id"] + [c for c in TEACHER_STRATEGY_COLUMNS if c in x.columns]
+    # 保留服務端可能提供的必要老師欄位，但不讓 date/open/high/low/close 等 context 欄位重新 merge 回 ranking_result。
+    return x[allowed].drop_duplicates(subset=["stock_id"], keep="last")
 
 
 try:
@@ -3367,12 +3445,29 @@ class DBManager:
         return int(row[0]) if row and row[0] is not None else 0
 
     def replace_ranking(self, df: pd.DataFrame):
+        """安全寫入 ranking_result。
+
+        V17-R4 修正每日增量更新後 table ranking_result has no column named date_x：
+        - 寫入前統一 date_x/date_y → date
+        - 移除 pandas merge suffix 欄位
+        - 套用 ranking_result schema 白名單，只寫入 DB 已存在欄位
+        - 先完成欄位檢查，再 DELETE 舊資料，避免寫入失敗造成當日排行被清空
+        """
+        if df is None or df.empty:
+            return
         today = datetime.now().strftime("%Y-%m-%d")
+        x = normalize_ranking_result_columns(df)
+        if "date" not in x.columns:
+            x["date"] = today
+        x["date"] = x["date"].fillna(today).astype(str).replace("", today)
+        # 重排行以今日為準；若上游殘留其他日期，統一寫今日，避免 DELETE/INSERT 日期不一致。
+        x["date"] = today
         with self.lock:
+            x = filter_df_to_table_schema(self.conn, x, "ranking_result", log_prefix="RANKING_RESULT_WRITE")
             cur = self.conn.cursor()
             cur.execute("DELETE FROM ranking_result WHERE date=?", (today,))
             self.conn.commit()
-            df.to_sql("ranking_result", self.conn, if_exists="append", index=False)
+            x.to_sql("ranking_result", self.conn, if_exists="append", index=False)
             self.conn.commit()
 
 
