@@ -6239,7 +6239,7 @@ class FinancialFeatureEngine:
         except Exception:
             return pd.DataFrame()
 
-    def build_feature_batch(self, run_id: str | None = None, write_db: bool = True, log_limit: int = 10, force_rebuild: bool = False) -> pd.DataFrame:
+    def build_feature_batch(self, run_id: str | None = None, write_db: bool = True, log_limit: int = 0, force_rebuild: bool = False) -> pd.DataFrame:
         run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         feature_date = datetime.now().strftime("%Y-%m-%d")
         master = self.db.get_master()
@@ -7548,11 +7548,74 @@ def normalize_core_analysis_df(df: pd.DataFrame) -> pd.DataFrame:
     return x[CORE_ANALYSIS_COLUMNS].copy()
 
 
+
+def ensure_trade_display_source_fields(df: pd.DataFrame) -> pd.DataFrame:
+    """V17-P0 STARTUP_PERF_GUARD：顯示層前置欄位一次補齊。
+
+    目的：
+    1) 第二次開程式時，UI 不再因 build_display_columns 逐欄觸發缺欄位 WARNING。
+    2) 把缺少的交易顯示欄位改為「一次性向量化預設」，避免 MainThread 產生大量 log 與補值開銷。
+    3) 此函式不重算策略、不抓外部資料、不重建 EPS MATRIX，只做輕量 schema 對齊。
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+    x = df.copy()
+    idx = x.index
+
+    def _num(col: str, default=np.nan):
+        if col in x.columns:
+            return pd.to_numeric(pd.Series(x[col], index=idx, copy=True), errors="coerce")
+        return pd.Series(default, index=idx, dtype="float64")
+
+    close = _num("close", np.nan)
+    if close.isna().all() and "現價" in x.columns:
+        close = _num("現價", np.nan)
+    atr = _num("atr", np.nan)
+    atr_pct = _num("atr_pct", np.nan)
+    if atr.isna().all():
+        atr = (close.abs() * atr_pct.fillna(2.5) / 100.0).replace(0, np.nan)
+    atr = atr.fillna((close.abs() * 0.025).replace(0, np.nan)).fillna(1.0)
+
+    defaults = {
+        "entry": close,
+        "entry_low": (close - atr * 0.5),
+        "entry_high": (close + atr * 0.5),
+        "entry_zone": pd.Series("", index=idx, dtype="object"),
+        "stop": (close - atr * 1.5),
+        "stop_loss": (close - atr * 1.5),
+        "target_price": (close + atr * 2.0),
+        "target_1382": (close + atr * 2.0),
+        "target1382": (close + atr * 2.0),
+        "target_1618": (close + atr * 2.6),
+        "position_pct": pd.Series(0.0, index=idx, dtype="float64"),
+        "kelly_raw": pd.Series(0.0, index=idx, dtype="float64"),
+        "qty": pd.Series(0, index=idx, dtype="int64"),
+        "shares": pd.Series(0, index=idx, dtype="int64"),
+        "suggest_qty": pd.Series(0, index=idx, dtype="int64"),
+        "amount": pd.Series(0.0, index=idx, dtype="float64"),
+        "suggest_amount": pd.Series(0.0, index=idx, dtype="float64"),
+        "single_position_pct": pd.Series(0.0, index=idx, dtype="float64"),
+        "single_pct": pd.Series(0.0, index=idx, dtype="float64"),
+        "theme_exposure_pct": pd.Series(0.0, index=idx, dtype="float64"),
+        "theme_pct": pd.Series(0.0, index=idx, dtype="float64"),
+        "industry_exposure_pct": pd.Series(0.0, index=idx, dtype="float64"),
+        "industry_pct": pd.Series(0.0, index=idx, dtype="float64"),
+        "portfolio_state": pd.Series("未配置", index=idx, dtype="object"),
+        "risk_note": pd.Series("", index=idx, dtype="object"),
+        "priority": pd.Series(np.arange(1, len(x) + 1), index=idx, dtype="int64"),
+    }
+    for col, val in defaults.items():
+        if col not in x.columns:
+            x[col] = val
+    return x
+
 def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    x = df.copy()
+    x = ensure_trade_display_source_fields(df)
+    if x is None or x.empty:
+        return pd.DataFrame()
     # V9.5.9：補齊外部資訊欄位，避免 UI/Excel 因缺欄位或純量 fillna 崩潰。
     for col, default in [("analysis_ready", 1), ("execution_ready", 0), ("soft_block", 0), ("block_reason", ""), ("execution_block_reason", "")]:
         if col not in x.columns:
@@ -7566,6 +7629,10 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
     def _log_missing_columns(*cols: str):
         missing = sorted({c for c in cols if c not in x.columns})
         if missing:
+            # V17-P0：顯示層缺欄位已由 ensure_trade_display_source_fields 一次補齊；
+            # 預設不再於 MainThread 大量輸出 WARNING，避免第二次開程式卡住。
+            if str(os.getenv("GTC_DEBUG_DISPLAY_SCHEMA", "0")).strip() != "1":
+                return
             key = tuple(missing)
             if key not in BUILD_DISPLAY_WARNING_CACHE:
                 BUILD_DISPLAY_WARNING_CACHE.add(key)
@@ -9831,7 +9898,7 @@ class AppUI:
 
                 def _refresh_and_mark():
                     try:
-                        self.refresh_all_tables(auto_rebuild=False)
+                        self.refresh_all_tables(auto_rebuild=False, startup_light=True)
                     finally:
                         done.set()
 
@@ -12942,7 +13009,7 @@ class AppUI:
         except Exception:
             pass
 
-    def refresh_all_tables(self, force_full_ranking: bool = False, auto_rebuild: bool = False):
+    def refresh_all_tables(self, force_full_ranking: bool = False, auto_rebuild: bool = False, startup_light: bool = False):
         for tree in (self.dashboard_tree, self.sop_tree, self.rotation_tree, self.rank_tree, self.sector_tree, self.theme_tree):
             for item in tree.get_children():
                 tree.delete(item)
@@ -13021,6 +13088,16 @@ class AppUI:
                 f"{r['hot_score']:.2f}", r["rotation"]
             ))
 
+        if startup_light:
+            # V17-P0 STARTUP_PERF_GUARD：開機/第二次開程式只載入既有排行與儀表板，
+            # 不在 MainThread 觸發 get_trade_pool / EPS MATRIX / 老師策略強制重建。
+            self.set_status(f"開機快速載入完成，共 {len(df)} 檔｜未重建 EPS MATRIX / AI TOP20 / 老師策略。")
+            try:
+                self.append_log("[STARTUP][LIGHT] 已快速載入既有排行；AI TOP20/老師策略請由按鈕執行或使用快照。")
+            except Exception:
+                pass
+            return
+
         trade = self.master_trading_engine.get_trade_pool(df)
         self.populate_operation_sop(trade["market"], trade["trade_top20"], trade["today_buy"], trade["wait_pullback"], trade["attack"], trade["defense"])
         attack_cnt = len(trade["attack"])
@@ -13031,7 +13108,7 @@ class AppUI:
         if (self.last_top20_df is not None and not self.last_top20_df.empty) or (self.last_order_list_df is not None and not self.last_order_list_df.empty):
             self.refresh_top20_and_order_views()
         try:
-            self.refresh_teacher_strategy_table(force_rebuild=True)
+            self.refresh_teacher_strategy_table(force_rebuild=False)
         except Exception as exc:
             log_warning(f"老師策略UI刷新略過：{exc}")
 
