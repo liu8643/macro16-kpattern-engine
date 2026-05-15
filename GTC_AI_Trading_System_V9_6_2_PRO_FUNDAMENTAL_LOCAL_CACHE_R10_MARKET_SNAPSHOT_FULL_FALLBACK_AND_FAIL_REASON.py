@@ -581,6 +581,14 @@ BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
 APP_NAME = "GTC AI Trading System v9.6.2 PRO V17-PHASE3_TEACHER_UI_GATE"
 
+# V17-P1 STARTUP_REAL_FIX：2026-05-15
+# 目的：第二次開程式不得再於 MainThread 執行 build_display_columns / EPS MATRIX / AI TOP20 重計算。
+STARTUP_REAL_FIX_ID = "V17-P1-STARTUP-REAL-FIX-20260515"
+# 強制關閉顯示欄位缺欄位 WARNING；若要除錯，請改用 GTC_ALLOW_DISPLAY_SCHEMA_WARNING=1。
+os.environ["GTC_DEBUG_DISPLAY_SCHEMA"] = "0"
+os.environ.setdefault("GTC_ALLOW_DISPLAY_SCHEMA_WARNING", "0")
+os.environ.setdefault("GTC_DEBUG_EPS_CACHE", "0")
+
 # V9.5.5 EPS_OFFICIAL_SOURCE：外部 EPS / 估值資料源正式規範
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
 TWSE_OPENAPI_LICENSE_URL = "http://data.gov.tw/license"
@@ -677,6 +685,7 @@ def log_exception(message: str, exc: Exception | None = None):
         pass
 
 SELECTED_PLOT_FONT = configure_matplotlib_cjk_font()
+log_info(f"[STARTUP_REAL_FIX] active={STARTUP_REAL_FIX_ID}｜display_schema_warning=OFF｜startup_light_no_build_display=ON")
 
 
 PACKED_DATA_DIR = BASE_DIR / "data"
@@ -6252,7 +6261,10 @@ class FinancialFeatureEngine:
         if write_db and not force_rebuild:
             cache_ok, cache_rows = self._existing_feature_batch_ok(feature_date, len(master))
             if cache_ok:
-                log_info(f"[EPS MATRIX][CACHE HIT][R8] feature_date={feature_date} rows={cache_rows} skip_rebuild=1")
+                # V17-P1 STARTUP_REAL_FIX：cache hit 不再於 MainThread 預設輸出，
+                # 避免使用者誤判為正在重建 EPS MATRIX；需要除錯才開 GTC_DEBUG_EPS_CACHE=1。
+                if str(os.getenv("GTC_DEBUG_EPS_CACHE", "0")).strip() == "1":
+                    log_info(f"[EPS MATRIX][CACHE HIT][R8] feature_date={feature_date} rows={cache_rows} skip_rebuild=1")
                 return self._load_feature_batch_from_cache(feature_date)
 
         base = master[["stock_id"]].copy()
@@ -7627,12 +7639,14 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
     def _log_missing_columns(*cols: str):
+        # V17-P1 STARTUP_REAL_FIX：
+        # 這裡原本會在 MainThread 逐欄輸出 WARNING，造成第二次開程式看起來「沒有回應」。
+        # 顯示欄位缺值已由 ensure_trade_display_source_fields() 一次向量化補齊，
+        # 因此預設完全靜默；只有明確設定 GTC_ALLOW_DISPLAY_SCHEMA_WARNING=1 才允許輸出。
+        if str(os.getenv("GTC_ALLOW_DISPLAY_SCHEMA_WARNING", "0")).strip() != "1":
+            return
         missing = sorted({c for c in cols if c not in x.columns})
         if missing:
-            # V17-P0：顯示層缺欄位已由 ensure_trade_display_source_fields 一次補齊；
-            # 預設不再於 MainThread 大量輸出 WARNING，避免第二次開程式卡住。
-            if str(os.getenv("GTC_DEBUG_DISPLAY_SCHEMA", "0")).strip() != "1":
-                return
             key = tuple(missing)
             if key not in BUILD_DISPLAY_WARNING_CACHE:
                 BUILD_DISPLAY_WARNING_CACHE.add(key)
@@ -9898,6 +9912,7 @@ class AppUI:
 
                 def _refresh_and_mark():
                     try:
+                        # V17-P1 STARTUP_REAL_FIX：startup_light 已改為只讀排行快照，不觸發 build_display_columns。
                         self.refresh_all_tables(auto_rebuild=False, startup_light=True)
                     finally:
                         done.set()
@@ -13025,6 +13040,36 @@ class AppUI:
             else:
                 self.set_status("目前尚無排行資料，請先初始化、建立歷史，再重建排行。")
             self.show_welcome_message()
+            return
+
+        if startup_light:
+            # V17-P1 STARTUP_REAL_FIX：
+            # 開機/第二次開程式只做「輕量快照載入」，不得呼叫 _filtered_ranking()
+            # 因為 _filtered_ranking() 會進 enrich_price_and_export_fields() → build_display_columns()。
+            # 這是先前 MainThread 卡住與大量 WARNING 的真正來源。
+            try:
+                df = self.db.get_latest_ranking()
+            except Exception:
+                df = pd.DataFrame()
+            if df is None or df.empty:
+                self.set_status("開機快速載入：目前沒有既有排行；請執行每日更新或重建排行。")
+                self.show_welcome_message()
+                return
+            try:
+                df = df.sort_values(["rank_all"]).reset_index(drop=True)
+            except Exception:
+                df = df.reset_index(drop=True)
+            # 只顯示前 200 檔，避免開機一次插入 2000+ TreeView rows 卡住。
+            view_df = df.head(200).copy()
+            try:
+                self._populate_rank_tree(view_df)
+            except Exception as exc:
+                log_warning(f"[STARTUP_REAL_FIX] startup_light populate rank skipped: {exc}")
+            self.set_status(f"開機快速載入完成：排行快照 {len(df)} 檔，先顯示前 {len(view_df)} 檔；未重建 EPS MATRIX / AI TOP20 / 老師策略。")
+            try:
+                self.append_log(f"[STARTUP_REAL_FIX] {STARTUP_REAL_FIX_ID}：開機只讀排行快照，不執行 build_display_columns / EPS MATRIX / AI TOP20。")
+            except Exception:
+                pass
             return
 
         used_full_fallback = False
