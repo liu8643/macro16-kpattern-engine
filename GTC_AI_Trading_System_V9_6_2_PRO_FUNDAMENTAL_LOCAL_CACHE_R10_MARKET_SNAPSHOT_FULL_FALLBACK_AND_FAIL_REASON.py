@@ -6215,7 +6215,31 @@ class FinancialFeatureEngine:
         score = 0.5 * float(matrix_score) + 0.3 * eps_score + 0.2 * rev_score + float(modifier)
         return round(self._clamp(score), 2)
 
-    def build_feature_batch(self, run_id: str | None = None, write_db: bool = True, log_limit: int = 10) -> pd.DataFrame:
+
+    def _existing_feature_batch_ok(self, feature_date: str, master_count: int, coverage_ratio: float = 0.90) -> tuple[bool, int]:
+        """P0效能修正：同一交易日 financial_feature_daily 已完成時，AI TOP20/顯示層不得再次重建2267筆。"""
+        try:
+            with self.db.lock:
+                cur = self.db.conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM financial_feature_daily WHERE feature_date=?", (feature_date,))
+                row_count = int((cur.fetchone() or [0])[0] or 0)
+            min_rows = int(max(1, master_count) * float(coverage_ratio))
+            return row_count >= min_rows, row_count
+        except Exception:
+            return False, 0
+
+    def _load_feature_batch_from_cache(self, feature_date: str) -> pd.DataFrame:
+        try:
+            with self.db.lock:
+                return pd.read_sql_query(
+                    "SELECT * FROM financial_feature_daily WHERE feature_date=?",
+                    self.db.conn,
+                    params=(feature_date,),
+                )
+        except Exception:
+            return pd.DataFrame()
+
+    def build_feature_batch(self, run_id: str | None = None, write_db: bool = True, log_limit: int = 10, force_rebuild: bool = False) -> pd.DataFrame:
         run_id = run_id or datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         feature_date = datetime.now().strftime("%Y-%m-%d")
         master = self.db.get_master()
@@ -6224,6 +6248,12 @@ class FinancialFeatureEngine:
         latest_close_map = self._latest_close_map()
         if master is None or master.empty:
             return pd.DataFrame()
+
+        if write_db and not force_rebuild:
+            cache_ok, cache_rows = self._existing_feature_batch_ok(feature_date, len(master))
+            if cache_ok:
+                log_info(f"[EPS MATRIX][CACHE HIT][R8] feature_date={feature_date} rows={cache_rows} skip_rebuild=1")
+                return self._load_feature_batch_from_cache(feature_date)
 
         base = master[["stock_id"]].copy()
         base["stock_id"] = self._normalize_stock_id_series(base["stock_id"])
@@ -6289,21 +6319,21 @@ class FinancialFeatureEngine:
         both_na_ratio = float((out["matrix_cell"].astype(str) == "E_NA-R_NA").mean())
         core_ne_ratio = float(out["data_quality_flag"].fillna("").astype(str).str.contains(r"EPS_NE|REV_NE|SOURCE_NE", regex=True).mean())
 
-        # V9.6.2-R8：強制輸出 merge 驗證資訊到 console / EXE 視窗。
-        # 不只依賴 log_info，避免 UI log 未接到時無法確認 EPS / Revenue 是否真的合併成功。
-        try:
-            print("\n====== DEBUG R8 FINANCIAL MERGE ======", flush=True)
-            print(f"valuation_rows={valuation_rows}", flush=True)
-            print(f"revenue_rows={revenue_rows}", flush=True)
-            print(f"valuation_hit={valuation_hit}", flush=True)
-            print(f"revenue_hit={revenue_hit}", flush=True)
-            print(f"eps_ok={eps_ok}", flush=True)
-            print(f"revenue_ok={revenue_ok}", flush=True)
-            print(f"both_NA_ratio={both_na_ratio:.2%}", flush=True)
-            print(f"core_NE_ratio={core_ne_ratio:.2%}", flush=True)
-            print("======================================\n", flush=True)
-        except Exception:
-            pass
+        # V17-PERF：預設不再大量輸出 console；需要逐項驗證時設定 GTC_DEBUG_EPS_MATRIX=1。
+        if str(os.getenv("GTC_DEBUG_EPS_MATRIX", "0")).strip() == "1":
+            try:
+                print("\n====== DEBUG R8 FINANCIAL MERGE ======", flush=True)
+                print(f"valuation_rows={valuation_rows}", flush=True)
+                print(f"revenue_rows={revenue_rows}", flush=True)
+                print(f"valuation_hit={valuation_hit}", flush=True)
+                print(f"revenue_hit={revenue_hit}", flush=True)
+                print(f"eps_ok={eps_ok}", flush=True)
+                print(f"revenue_ok={revenue_ok}", flush=True)
+                print(f"both_NA_ratio={both_na_ratio:.2%}", flush=True)
+                print(f"core_NE_ratio={core_ne_ratio:.2%}", flush=True)
+                print("======================================\n", flush=True)
+            except Exception:
+                pass
 
         if write_db:
             self.db.replace_financial_feature_batch(out, run_id=run_id)
@@ -6312,9 +6342,10 @@ class FinancialFeatureEngine:
                 f"valuation_hit={valuation_hit} revenue_hit={revenue_hit} eps_ok={eps_ok} revenue_ok={revenue_ok} "
                 f"both_NA_ratio={both_na_ratio:.2%} core_NE_ratio={core_ne_ratio:.2%}"
             )
-            sample = out.head(log_limit)
-            for _, rr in sample.iterrows():
-                log_info(f"[EPS MATRIX][BUILD][R7] run_id={run_id} stock={rr.get('stock_id')} eps_ttm={rr.get('eps_ttm')} rev_yoy={rr.get('revenue_yoy')} cell={rr.get('matrix_cell')} cat={rr.get('eps_category')} score={rr.get('revenue_eps_score')} flag={rr.get('data_quality_flag')}")
+            if int(log_limit or 0) > 0:
+                sample = out.head(int(log_limit))
+                for _, rr in sample.iterrows():
+                    log_info(f"[EPS MATRIX][BUILD][R7] run_id={run_id} stock={rr.get('stock_id')} eps_ttm={rr.get('eps_ttm')} rev_yoy={rr.get('revenue_yoy')} cell={rr.get('matrix_cell')} cat={rr.get('eps_category')} score={rr.get('revenue_eps_score')} flag={rr.get('data_quality_flag')}")
             log_info(f"[EPS MATRIX][BUILD][R7] run_id={run_id} rows={len(out)}")
         return out
 
@@ -8981,7 +9012,7 @@ class MasterTradingEngine:
         base = filtered_df.copy()
         hot_themes = ThemeStrengthEngine.get_hot_themes(base)
         try:
-            feature_rows = FinancialFeatureEngine(self.db).build_feature_batch(write_db=True)
+            feature_rows = FinancialFeatureEngine(self.db).build_feature_batch(write_db=True, log_limit=0)
             if log_cb:
                 log_cb(f"[EPS MATRIX][BUILD] AI選股前已更新 financial_feature_daily：{0 if feature_rows is None else len(feature_rows)} 筆")
         except Exception as exc:
@@ -9743,6 +9774,8 @@ class AppUI:
         self.worker = None
         self.cancel_event = threading.Event()
         self.current_job = None
+        self.top20_snapshot_ttl_sec = 24 * 60 * 60
+        self.top20_snapshot_signature = ""
         self.history_batch_size = 25
         self.history_sleep_sec = 0.6
         self.last_job_summary = {}
@@ -10744,7 +10777,9 @@ class AppUI:
 
     def _run_in_thread(self, target, name="worker"):
         if self.worker is not None and self.worker.is_alive():
-            messagebox.showwarning("提醒", "背景作業進行中，請稍候。")
+            running = self.current_job or "背景作業"
+            messagebox.showwarning("提醒", f"{running} 正在執行中，請稍候；系統已防止重複啟動。")
+            log_warning(f"[JOB][SKIP] request={name} running={running}")
             return
 
         def runner():
@@ -13170,6 +13205,109 @@ class AppUI:
         self.ui_call(self.append_log, f"[V9.5.9-PREFLIGHT-SOFT-BLOCK] 自動同步後外部資料仍未就緒，但不停止 {context}：{final_reason}", "WARNING")
         return 0, final_reason
 
+
+    def _df_to_snapshot_json(self, df: pd.DataFrame) -> str:
+        try:
+            if df is None:
+                df = pd.DataFrame()
+            return df.to_json(orient="split", force_ascii=False, date_format="iso")
+        except Exception:
+            return pd.DataFrame().to_json(orient="split", force_ascii=False)
+
+    def _snapshot_json_to_df(self, text: str) -> pd.DataFrame:
+        try:
+            if not text:
+                return pd.DataFrame()
+            return pd.read_json(io.StringIO(text), orient="split")
+        except Exception:
+            return pd.DataFrame()
+
+    def _top20_snapshot_signature(self, df: pd.DataFrame) -> str:
+        try:
+            ids = df.get("stock_id", pd.Series(dtype=str)).astype(str).head(3000).tolist()
+            payload = "|".join(ids) + "::" + STRATEGY_CONFIG_MANAGER.summary_text()
+            return hashlib.md5(payload.encode("utf-8", errors="ignore")).hexdigest()
+        except Exception:
+            return ""
+
+    def _ensure_ai_top20_snapshot_table(self):
+        with self.db.lock:
+            self.db.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ai_top20_snapshot_json (
+                    snapshot_key TEXT PRIMARY KEY,
+                    trade_date TEXT,
+                    signature TEXT,
+                    created_at TEXT,
+                    payload_json TEXT,
+                    row_count INTEGER
+                )
+                """
+            )
+            self.db.conn.commit()
+
+    def _save_ai_top20_snapshot(self, signature: str):
+        try:
+            self._ensure_ai_top20_snapshot_table()
+            trade_date = datetime.now().strftime("%Y-%m-%d")
+            payload = {
+                "last_top20_df": self._df_to_snapshot_json(self.last_top20_df),
+                "last_candidate_top20_df": self._df_to_snapshot_json(self.last_candidate_top20_df),
+                "last_top5_df": self._df_to_snapshot_json(self.last_top5_df),
+                "last_attack_df": self._df_to_snapshot_json(self.last_attack_df),
+                "last_watch_df": self._df_to_snapshot_json(self.last_watch_df),
+                "last_defense_df": self._df_to_snapshot_json(self.last_defense_df),
+                "last_today_buy_df": self._df_to_snapshot_json(self.last_today_buy_df),
+                "last_wait_df": self._df_to_snapshot_json(self.last_wait_df),
+                "last_order_list_df": self._df_to_snapshot_json(self.last_order_list_df),
+                "last_institutional_plan_df": self._df_to_snapshot_json(self.last_institutional_plan_df),
+                "last_unique_decision_df": self._df_to_snapshot_json(self.last_unique_decision_df),
+                "last_theme_summary_df": self._df_to_snapshot_json(self.last_theme_summary_df),
+            }
+            text = json.dumps(payload, ensure_ascii=False)
+            key = f"{trade_date}:AI_TOP20:{signature}"
+            with self.db.lock:
+                self.db.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO ai_top20_snapshot_json
+                    (snapshot_key, trade_date, signature, created_at, payload_json, row_count)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (key, trade_date, signature, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), text, int(len(self.last_top20_df) if self.last_top20_df is not None else 0)),
+                )
+                self.db.conn.commit()
+            log_info(f"[AI TOP20][SNAPSHOT SAVE] key={key} rows={len(self.last_top20_df) if self.last_top20_df is not None else 0}")
+        except Exception as exc:
+            log_warning(f"[AI TOP20][SNAPSHOT SAVE][WARN] {exc}")
+
+    def _load_ai_top20_snapshot(self, signature: str) -> bool:
+        try:
+            self._ensure_ai_top20_snapshot_table()
+            trade_date = datetime.now().strftime("%Y-%m-%d")
+            key = f"{trade_date}:AI_TOP20:{signature}"
+            with self.db.lock:
+                row = self.db.conn.execute(
+                    "SELECT payload_json, created_at, row_count FROM ai_top20_snapshot_json WHERE snapshot_key=?",
+                    (key,),
+                ).fetchone()
+            if not row:
+                return False
+            payload_json, created_at, row_count = row
+            payload = json.loads(payload_json or "{}")
+            for attr, text in payload.items():
+                setattr(self, attr, self._snapshot_json_to_df(text))
+            self.cache_trade_dataframe(self.last_top20_df)
+            self.cache_trade_dataframe(self.last_top5_df)
+            self.cache_trade_dataframe(self.last_attack_df)
+            self.cache_trade_dataframe(self.last_today_buy_df)
+            self.cache_trade_dataframe(self.last_wait_df)
+            self.cache_backtest_dataframe(self.last_top5_df)
+            log_info(f"[AI TOP20][SNAPSHOT LOAD] key={key} rows={row_count} created_at={created_at}")
+            return True
+        except Exception as exc:
+            log_warning(f"[AI TOP20][SNAPSHOT LOAD][WARN] {exc}")
+            return False
+
     def show_top20(self):
         if not self.ensure_ranking_ready(auto_rebuild=True):
             return messagebox.showwarning("提醒", "目前尚無可用排行資料，請先建立歷史資料後重建排行。")
@@ -13184,6 +13322,16 @@ class AppUI:
                     return messagebox.showwarning("提醒", "目前沒有可用排行資料")
             except Exception:
                 return messagebox.showwarning("提醒", "目前篩選條件下沒有可用資料")
+
+        signature = self._top20_snapshot_signature(df)
+        if self._load_ai_top20_snapshot(signature):
+            self.clear_log()
+            self.append_log("[AI TOP20][SNAPSHOT LOAD] 命中今日快照，直接載入TOP20；未重跑EPS MATRIX/2080檔AI選股。")
+            self.refresh_top20_and_order_views()
+            self.left_notebook.select(self.tab_top20)
+            self.open_three_windows()
+            self.set_status("AI選股TOP20已由今日快照載入，未重算。")
+            return
 
         def worker():
             try:
@@ -13302,6 +13450,7 @@ class AppUI:
 
                 self.ui_call(self.detail.delete, "1.0", tk.END)
                 self.ui_call(self.detail.insert, "1.0", "\n".join(lines))
+                self._save_ai_top20_snapshot(signature)
                 self.ui_call(self.finish_task, "AI選股TOP20", f"AI選股完成：TOP20 {len(trade_top20)}｜今日可下單 {len(today_buy)}｜等待 {len(wait_pullback)}")
             except OperationCancelled:
                 self.ui_call(self.finish_task, "AI選股TOP20", "AI選股TOP20 已中斷")
