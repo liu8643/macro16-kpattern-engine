@@ -13541,6 +13541,7 @@ class AppUI:
                 rank_count = int(workflow_state.get("rank_count", 0) or 0)
                 self.force_show_full_ranking_once = True
                 self.ui_call(self._refresh_analysis_views_only, True)
+                self.ui_call(self._build_ai_top20_snapshot_from_ranking, 20, True)
                 self.ui_call(self.show_welcome_message)
                 self.ui_call(self.append_log, f"[WORKFLOW][Daily_Update_Master] END｜rows={rows}｜features={cache_result.get('feature_rows', 0)}｜ranking={rank_count}")
                 self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，基本面特徵 {cache_result.get('feature_rows', 0)} 筆，排行 {rank_count} 檔。")
@@ -13608,6 +13609,7 @@ class AppUI:
 
                 self.force_show_full_ranking_once = True
                 self.ui_call(self._refresh_analysis_views_only, True)
+                self.ui_call(self._build_ai_top20_snapshot_from_ranking, 20, True)
                 self.ui_call(self.append_log, f"[WORKFLOW][FAST_RANK_REBUILD] END｜ranking={count}｜禁止EPS BUILD/外部API")
                 self.ui_call(self.finish_task, "快速重算排行", f"快速重算排行已完成，共 {count} 檔")
                 if count <= 0:
@@ -13802,8 +13804,76 @@ class AppUI:
             log_warning(f"[AI TOP20][SNAPSHOT LOAD][WARN] {exc}")
             return False
 
-    def _read_top20_snapshot_for_view(self, top_n: int = 20, **_kwargs):
-        """AI TOP20 純讀快照：只讀 ranking_result / teacher_strategy_snapshot，不觸發任何重算。"""
+    def _load_latest_ai_top20_snapshot(self) -> bool:
+        """V12：讀取最新非空 AI TOP20 快照。
+
+        修正目的：
+        - 舊版 _load_ai_top20_snapshot 需要 signature，AI_TOP20_VIEW 無法知道當日 signature 時會退回 rows=0。
+        - 新版先讀今日最新 row_count>0 快照；若今日沒有，再讀最近一筆非空快照。
+        - 只讀 DB 快照，不觸發重建排行 / 每日更新 / EPS MATRIX。
+        """
+        try:
+            self._ensure_ai_top20_snapshot_table()
+            trade_date = datetime.now().strftime("%Y-%m-%d")
+            with self.db.lock:
+                row = self.db.conn.execute(
+                    """
+                    SELECT snapshot_key, payload_json, created_at, row_count
+                    FROM ai_top20_snapshot_json
+                    WHERE trade_date=? AND COALESCE(row_count,0)>0
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (trade_date,),
+                ).fetchone()
+                if not row:
+                    row = self.db.conn.execute(
+                        """
+                        SELECT snapshot_key, payload_json, created_at, row_count
+                        FROM ai_top20_snapshot_json
+                        WHERE COALESCE(row_count,0)>0
+                        ORDER BY trade_date DESC, created_at DESC
+                        LIMIT 1
+                        """
+                    ).fetchone()
+            if not row:
+                return False
+            snapshot_key, payload_json, created_at, row_count = row
+            payload = json.loads(payload_json or "{}")
+            for attr, text in payload.items():
+                setattr(self, attr, self._snapshot_json_to_df(text))
+            self.cache_trade_dataframe(self.last_top20_df)
+            self.cache_trade_dataframe(self.last_top5_df)
+            self.cache_trade_dataframe(self.last_attack_df)
+            self.cache_trade_dataframe(self.last_today_buy_df)
+            self.cache_trade_dataframe(self.last_wait_df)
+            self.cache_backtest_dataframe(self.last_top5_df)
+            log_info(f"[AI TOP20][SNAPSHOT LOAD_LATEST] key={snapshot_key} rows={row_count} created_at={created_at}")
+            return bool(self.last_top20_df is not None and not self.last_top20_df.empty)
+        except Exception as exc:
+            log_warning(f"[AI TOP20][SNAPSHOT LOAD_LATEST][WARN] {exc}")
+            return False
+
+    def _build_ai_top20_snapshot_from_ranking(self, top_n: int = 20, save_snapshot: bool = True) -> pd.DataFrame:
+        """V12：由最新 ranking_result 建立 AI TOP20 快照，不觸發重算。
+
+        用途：每日增量更新 / 快速重建排行完成後，將最新 ranking_result 轉成 TOP20 快照。
+        這是修正 A log 中 AI_TOP20_VIEW rows=0 的核心補丁。
+        """
+        df = self._read_top20_snapshot_from_ranking(top_n=top_n)
+        if df is None or df.empty:
+            log_warning("[AI TOP20][SNAPSHOT BUILD][WARN] latest ranking_result empty; snapshot not saved")
+            return pd.DataFrame()
+        self._apply_top20_state_from_df(df)
+        if save_snapshot:
+            signature = self._top20_snapshot_signature(df)
+            self.top20_snapshot_signature = signature
+            self._save_ai_top20_snapshot(signature)
+        log_info(f"[AI TOP20][SNAPSHOT BUILD] source=latest_ranking rows={len(df)}")
+        return df
+
+    def _read_top20_snapshot_from_ranking(self, top_n: int = 20) -> pd.DataFrame:
+        """V12：只由 latest ranking_result + teacher_snapshot 建立 TOP20 view dataframe。"""
         ranking = self.db.get_latest_ranking()
         if ranking is None or ranking.empty:
             return pd.DataFrame()
@@ -13836,11 +13906,9 @@ class AppUI:
             log_warning(f"[AI_TOP20_VIEW] enrich display fields skipped: {exc}")
         return x
 
-    def _render_top20_snapshot_view(self, top20_df, **_kwargs):
-        if top20_df is None or top20_df.empty:
-            messagebox.showwarning("提醒", "目前沒有 AI TOP20 快照資料。請先執行『每日增量更新』產生 ranking_result。")
-            return False
-        df = top20_df.copy()
+    def _apply_top20_state_from_df(self, top20_df: pd.DataFrame) -> pd.DataFrame:
+        """V12：統一設定 AI TOP20 相關 last_* 狀態，避免顯示 / 匯出 / 回測各自產生不同快照。"""
+        df = top20_df.copy() if top20_df is not None else pd.DataFrame()
         self.last_top20_df = df
         self.last_candidate_top20_df = df.copy()
         self.last_top5_df = df.head(5).copy()
@@ -13864,10 +13932,44 @@ class AppUI:
             self.last_order_list_df = pd.DataFrame()
         self.last_institutional_plan_df = pd.DataFrame()
         self.last_unique_decision_df = df.head(REPORT_DECISION_LIMITS.get("unique_decision", 20)).copy()
-        self.cache_trade_dataframe(self.last_top20_df)
-        self.cache_trade_dataframe(self.last_top5_df)
-        self.cache_trade_dataframe(self.last_today_buy_df)
-        self.cache_backtest_dataframe(self.last_top5_df)
+        try:
+            self.cache_trade_dataframe(self.last_top20_df)
+            self.cache_trade_dataframe(self.last_top5_df)
+            self.cache_trade_dataframe(self.last_today_buy_df)
+            self.cache_backtest_dataframe(self.last_top5_df)
+        except Exception:
+            pass
+        return df
+
+    def _read_top20_snapshot_for_view(self, top_n: int = 20, **_kwargs):
+        """AI TOP20 純讀快照：優先讀 ai_top20_snapshot_json；無快照才 fallback latest ranking_result。"""
+        try:
+            if self._load_latest_ai_top20_snapshot():
+                df = self.last_top20_df.copy() if self.last_top20_df is not None else pd.DataFrame()
+                if df is not None and not df.empty:
+                    out = df.head(int(top_n or 20)).copy()
+                    log_info(f"[AI_TOP20_VIEW][READ] source=ai_top20_snapshot_json rows={len(out)}")
+                    return out
+        except Exception as exc:
+            log_warning(f"[AI_TOP20_VIEW][READ][SNAPSHOT_WARN] {exc}")
+        out = self._read_top20_snapshot_from_ranking(top_n=top_n)
+        if out is not None and not out.empty:
+            log_info(f"[AI_TOP20_VIEW][READ] source=latest_ranking_result rows={len(out)}")
+        else:
+            log_warning("[AI_TOP20_VIEW][READ][WARN] no snapshot and latest ranking_result empty")
+        return out
+
+    def _render_top20_snapshot_view(self, top20_df, **_kwargs):
+        if top20_df is None or top20_df.empty:
+            messagebox.showwarning("提醒", "目前沒有 AI TOP20 快照資料。請先執行『每日增量更新』產生 ranking_result。")
+            return False
+        df = self._apply_top20_state_from_df(top20_df)
+        try:
+            signature = self._top20_snapshot_signature(df)
+            self.top20_snapshot_signature = signature
+            self._save_ai_top20_snapshot(signature)
+        except Exception as exc:
+            log_warning(f"[AI TOP20][SNAPSHOT SAVE AFTER RENDER][WARN] {exc}")
         self.refresh_top20_and_order_views()
         self.left_notebook.select(self.tab_top20)
         self.open_three_windows()
@@ -13906,7 +14008,8 @@ class AppUI:
             else:
                 top20_df = self._read_top20_snapshot_for_view(top_n=20)
                 self._render_top20_snapshot_view(top20_df)
-            self.append_log("[WORKFLOW][AI_TOP20_VIEW] END｜只讀 ranking_result / teacher_snapshot；未執行 ranking_rebuild / update_daily / EPS MATRIX")
+            _rows = len(self.last_top20_df) if self.last_top20_df is not None else 0
+            self.append_log(f"[WORKFLOW][AI_TOP20_VIEW] END｜rows={_rows}｜只讀 ai_top20_snapshot/ranking_result/teacher_snapshot；未執行 ranking_rebuild / update_daily / EPS MATRIX")
         except Exception as e:
             traceback.print_exc()
             messagebox.showerror("錯誤", str(e))
