@@ -1,3 +1,4 @@
+KPATTERN_READ_ONLY_GUARD = True  # V17.1: KPattern service must be read-only; no external API / no DB rebuild.
 from kpattern_module.kpattern_pipeline import KPatternPipeline
 
 
