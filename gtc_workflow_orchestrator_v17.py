@@ -468,20 +468,32 @@ class GTCWorkflowOrchestrator:
         top_n: int = 20,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """AI選股TOP20：純讀取快照，不得觸發任何 rebuild/update/build。"""
+        """AI選股TOP20：純讀取快照，不得觸發任何 rebuild/update/build。
+
+        V12 修正：原本使用 contextmanager 包住函式，但 Python with 區塊的回傳值不會回傳給
+        generator contextmanager，因此 WORKFLOW END rows 永遠是 0。
+        這會誤導驗收判斷為 AI_TOP20_VIEW rows=0。
+        本函式改成手動 start/end，明確把 read/render/export 的資料列數寫進 log。
+        """
         ctx = self._ctx(WorkflowMode.AI_TOP20_VIEW, top_n=top_n)
         result: Dict[str, Any] = {"run_id": ctx.run_id, "mode": ctx.mode.value, "top_n": top_n}
 
-        with self.stage(ctx, "01_read_top20_snapshot", Operation.SNAPSHOT_READ, heavy=False):
-            result["top20"] = read_top20_snapshot_fn(top_n=top_n, **kwargs)
+        self.guard.assert_allowed(ctx, Operation.SNAPSHOT_READ, "01_read_top20_snapshot")
+        _t0 = self.workflow_logger.start(ctx, "01_read_top20_snapshot")
+        result["top20"] = read_top20_snapshot_fn(top_n=top_n, **kwargs)
+        self.workflow_logger.end(ctx, "01_read_top20_snapshot", _t0, rows=_safe_len(result.get("top20")))
 
         if render_ui_fn:
-            with self.stage(ctx, "02_render_ui_top20", Operation.UI_RENDER, heavy=False):
-                result["ui"] = render_ui_fn(result.get("top20"), **kwargs)
+            self.guard.assert_allowed(ctx, Operation.UI_RENDER, "02_render_ui_top20")
+            _t1 = self.workflow_logger.start(ctx, "02_render_ui_top20")
+            result["ui"] = render_ui_fn(result.get("top20"), **kwargs)
+            self.workflow_logger.end(ctx, "02_render_ui_top20", _t1, rows=_safe_len(result.get("top20")))
 
         if export_fn:
-            with self.stage(ctx, "03_export_top20_snapshot", Operation.EXPORT_EXCEL, heavy=False):
-                result["export"] = export_fn(result.get("top20"), **kwargs)
+            self.guard.assert_allowed(ctx, Operation.EXPORT_EXCEL, "03_export_top20_snapshot")
+            _t2 = self.workflow_logger.start(ctx, "03_export_top20_snapshot")
+            result["export"] = export_fn(result.get("top20"), **kwargs)
+            self.workflow_logger.end(ctx, "03_export_top20_snapshot", _t2, rows=_safe_len(result.get("top20")))
 
         return result
 
