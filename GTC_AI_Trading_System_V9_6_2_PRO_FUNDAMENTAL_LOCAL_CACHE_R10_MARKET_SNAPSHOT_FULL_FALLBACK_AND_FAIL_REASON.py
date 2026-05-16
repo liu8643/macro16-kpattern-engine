@@ -14162,8 +14162,93 @@ def main():
     root.mainloop()
 
 
+def _write_startup_crash_report(exc: BaseException) -> Path:
+    """V11 STARTUP_CRASH_GUARD：EXE 直接閃退時保留完整錯誤。
+    目的：
+    1) 雙擊 EXE 若啟動失敗，不讓視窗直接消失。
+    2) 將 traceback 寫入 logs/startup_crash_*.log。
+    3) 同時嘗試跳出 messagebox，方便使用者知道要看哪個 log。
+    """
+    try:
+        runtime_dir = get_runtime_dir() if "get_runtime_dir" in globals() else Path.cwd()
+    except Exception:
+        runtime_dir = Path.cwd()
+
+    try:
+        log_dir = Path(runtime_dir) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        log_dir = Path.cwd()
+
+    crash_path = log_dir / f"startup_crash_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    try:
+        payload = []
+        payload.append("=" * 100)
+        payload.append("GTC AI Trading System - STARTUP CRASH REPORT")
+        payload.append("=" * 100)
+        payload.append(f"time={datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        payload.append(f"app={globals().get('APP_NAME', '')}")
+        payload.append(f"build_tag={globals().get('APP_BUILD_TAG', '')}")
+        payload.append(f"python={sys.version}")
+        payload.append(f"frozen={getattr(sys, 'frozen', False)}")
+        payload.append(f"executable={sys.executable}")
+        payload.append(f"cwd={os.getcwd()}")
+        payload.append(f"base_dir={globals().get('BASE_DIR', '')}")
+        payload.append(f"runtime_dir={globals().get('RUNTIME_DIR', '')}")
+        payload.append(f"workflow_orchestrator={globals().get('WORKFLOW_ORCHESTRATOR_IMPORT_STATUS', '')}")
+        payload.append(f"kpattern_service={globals().get('KPATTERN_SERVICE_IMPORT_STATUS', '')}")
+        payload.append(f"teacher_strategy={globals().get('TEACHER_STRATEGY_IMPORT_STATUS', '')}")
+        payload.append("-" * 100)
+        payload.append("TRACEBACK")
+        payload.append("-" * 100)
+        payload.append(traceback.format_exc())
+        crash_path.write_text("\n".join(payload), encoding="utf-8")
+    except Exception:
+        pass
+    return crash_path
+
+
+def _startup_crash_guard():
+    try:
+        main()
+    except Exception as exc:
+        crash_path = _write_startup_crash_report(exc)
+        msg = (
+            "程式啟動失敗，已保留錯誤報告：\n"
+            f"{crash_path}\n\n"
+            "請把這個 startup_crash log 傳回來，不要再猜錯誤。"
+        )
+
+        try:
+            log_exception("[STARTUP_CRASH_GUARD] application startup failed", exc)
+        except Exception:
+            pass
+
+        try:
+            print("\n" + "=" * 100)
+            print(msg)
+            print("=" * 100)
+            print(traceback.format_exc())
+            print("=" * 100)
+        except Exception:
+            pass
+
+        try:
+            import tkinter.messagebox as _mb
+            _mb.showerror("GTC AI Trading System 啟動失敗", msg)
+        except Exception:
+            pass
+
+        # EXE 以 console 模式雙擊時，避免錯誤視窗瞬間消失。
+        try:
+            if getattr(sys, "frozen", False):
+                input("按 Enter 關閉視窗...")
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
-    main()
+    _startup_crash_guard()
 
 
 # V9.5.6 MARGIN_INTEGRATED PATCH MARKER: external_margin + macro_margin_sentiment + DecisionLayer margin_score completed.
