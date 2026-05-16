@@ -5,6 +5,12 @@ on:
   push:
     branches: [ main ]
 
+# 防止連續上傳多個檔案時，同一 branch 同時跑多個 EXE build。
+# 新 commit 進來時，自動取消同 branch 仍在執行中的舊 build，只保留最新一次。
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-windows:
     runs-on: windows-latest
