@@ -31,7 +31,6 @@ jobs:
           dir services
           dir teacher_strategy
           dir kpattern_module
-          dir gtc_workflow_orchestrator_v17.py
 
       - name: Build EXE
         shell: cmd
