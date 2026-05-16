@@ -2180,7 +2180,7 @@ def parse_twse_mi_index_csv(csv_text: str) -> pd.DataFrame:
             continue
         if line.startswith("=") and "證券代號" in line:
             line = line.replace("=", "")
-        if not re.match(r'^[="]?\d{4}', line):
+        if not re.match(r'^[="]?\d{4,5}', line):
             continue
         try:
             cols = next(csv.reader([line]))
@@ -2190,8 +2190,9 @@ def parse_twse_mi_index_csv(csv_text: str) -> pd.DataFrame:
         if len(cols) < 11:
             continue
         code = cols[0]
-        if not (code.isdigit() and len(code) == 4):
+        if not (code.isdigit() and 4 <= len(code) <= 5):
             continue
+        code = normalize_stock_id(code)
         rows.append({
             "stock_id": code,
             "stock_name": cols[1] if len(cols) > 1 else "",
@@ -3558,11 +3559,57 @@ class DataEngine:
 
     @staticmethod
     def yahoo_symbol(stock_id: str, market: str) -> str:
-        if market in ("上市", "ETF"):
-            return f"{stock_id}.TW"
+        """Yahoo symbol resolver：只回傳主路由，不做大量猜測。"""
+        stock_id = normalize_stock_id(stock_id)
+        market = str(market or "").strip()
+        if not stock_id:
+            return ""
         if market == "上櫃":
             return f"{stock_id}.TWO"
-        return stock_id
+        if market in ("上市", "ETF"):
+            return f"{stock_id}.TW"
+        if stock_id.startswith("00"):
+            return f"{stock_id}.TW"
+        return f"{stock_id}.TW"
+
+    @staticmethod
+    def yahoo_symbol_candidates(stock_id: str, market: str, allow_guess: bool = False) -> list[str]:
+        """V8：每日增量 Yahoo fallback 的 symbol gate。
+        - 正常只使用市場對應主 suffix，避免 .TW/.TWO 亂猜造成大量 possibly delisted。
+        - 完整歷史建庫可視需要 allow_guess=True。
+        """
+        stock_id = normalize_stock_id(stock_id)
+        if not stock_id:
+            return []
+        market = str(market or "").strip()
+        primary = DataEngine.yahoo_symbol(stock_id, market)
+        candidates = [primary] if primary else []
+        if allow_guess:
+            for s in (f"{stock_id}.TW", f"{stock_id}.TWO"):
+                if s not in candidates:
+                    candidates.append(s)
+        return candidates
+
+    @staticmethod
+    def allow_yahoo_daily_fallback(stock_id: str, market: str, official_rows: int, master_rows: int, yahoo_used: int, max_yahoo: int = 120) -> bool:
+        """V8：每日增量 Yahoo fallback 限縮。
+        官方全市場資料為主；Yahoo 只補少數股票，避免 2267 檔逐檔打 Yahoo。
+        """
+        stock_id = normalize_stock_id(stock_id)
+        market = str(market or "").strip()
+        if not stock_id:
+            return False
+        # ETF/00 開頭商品官方沒命中時直接跳過，不進 Yahoo 噪音。
+        if market == "ETF" or stock_id.startswith("00"):
+            return False
+        if int(yahoo_used or 0) >= int(max_yahoo):
+            return False
+        if int(master_rows or 0) > 0:
+            hit_ratio = float(official_rows or 0) / float(master_rows or 1)
+            # 官方命中過低代表官方解析/連線問題，不可改用 Yahoo 全市場硬打。
+            if hit_ratio < 0.50:
+                return False
+        return True
 
     @staticmethod
     def _to_num(series: pd.Series) -> pd.Series:
@@ -3622,14 +3669,7 @@ class DataEngine:
     def download_history(self, stock_id: str, market: str, period: str = "2y") -> pd.DataFrame:
         if yf is None:
             return pd.DataFrame()
-        symbols = []
-        primary = self.yahoo_symbol(stock_id, market)
-        if primary:
-            symbols.append(primary)
-        if f"{stock_id}.TW" not in symbols:
-            symbols.append(f"{stock_id}.TW")
-        if f"{stock_id}.TWO" not in symbols:
-            symbols.append(f"{stock_id}.TWO")
+        symbols = self.yahoo_symbol_candidates(stock_id, market, allow_guess=True)
         seen = set()
         for symbol in symbols:
             if symbol in seen:
@@ -3658,15 +3698,7 @@ class DataEngine:
     def download_latest_bar_yahoo(self, stock_id: str, market: str, days: str = "7d") -> pd.DataFrame:
         if yf is None:
             return pd.DataFrame()
-        symbols = []
-        primary = self.yahoo_symbol(stock_id, market)
-        if primary:
-            symbols.append(primary)
-        if f"{stock_id}.TW" not in symbols:
-            symbols.append(f"{stock_id}.TW")
-        if f"{stock_id}.TWO" not in symbols:
-            symbols.append(f"{stock_id}.TWO")
-
+        symbols = self.yahoo_symbol_candidates(stock_id, market, allow_guess=False)
         seen = set()
         latest = pd.DataFrame()
         for symbol in symbols:
@@ -3745,6 +3777,9 @@ class DataEngine:
         return success, failed, rows
 
     def update_incremental(self, progress_cb=None, log_cb=None, cancel_cb=None) -> Tuple[int, int, int]:
+        """V8 DAILY_OFFICIAL_FIRST：每日增量更新必須以 TWSE/TPEx 官方全市場資料為主。
+        Yahoo 僅允許在官方命中率正常時補少數非 ETF 股票，避免 2267 檔逐檔打 Yahoo。
+        """
         master = self.db.get_master()
         if master.empty:
             return 0, 0, 0
@@ -3753,24 +3788,35 @@ class DataEngine:
         tpex_df = self.fetch_tpex_daily()
 
         official_map = {}
-        if not twse_df.empty:
-            for _, row in twse_df.iterrows():
-                official_map[str(row["stock_id"])] = pd.DataFrame([row])
-        if not tpex_df.empty:
-            for _, row in tpex_df.iterrows():
-                official_map[str(row["stock_id"])] = pd.DataFrame([row])
+        for source_name, src_df in (("TWSE", twse_df), ("TPEX", tpex_df)):
+            if src_df is not None and not src_df.empty:
+                for _, row in src_df.iterrows():
+                    sid = normalize_stock_id(row.get("stock_id"))
+                    if not sid:
+                        continue
+                    r = row.copy()
+                    r["stock_id"] = sid
+                    official_map[sid] = pd.DataFrame([r])
 
         success = 0
         failed = 0
         rows = 0
-        source_summary = {"official": 0, "yahoo": 0, "none": 0}
-
+        source_summary = {"official": 0, "yahoo": 0, "none": 0, "official_hit": len(official_map)}
         total = len(master)
+        official_hit_ratio = len(official_map) / max(total, 1)
+        yahoo_limit = int(os.getenv("GTC_DAILY_YAHOO_FALLBACK_LIMIT", "120") or 120)
+
+        if log_cb:
+            log_cb(f"[DAILY_OFFICIAL_FIRST] TWSE rows={0 if twse_df is None else len(twse_df)}｜TPEx rows={0 if tpex_df is None else len(tpex_df)}｜official_map={len(official_map)}｜master={total}｜hit_ratio={official_hit_ratio:.2%}｜Yahoo補洞上限={yahoo_limit}")
+            if official_hit_ratio < 0.50:
+                log_cb("[DAILY_OFFICIAL_FIRST][WARNING] 官方命中率低於 50%，判定官方資料解析/連線異常；本輪停止 Yahoo 全市場 fallback，避免 2267 檔逐檔打 Yahoo。")
+
+        yahoo_used = 0
         for idx, (_, row) in enumerate(master.iterrows(), start=1):
             if cancel_cb and cancel_cb():
                 raise OperationCancelled("使用者中斷每日增量更新")
-            stock_id = str(row["stock_id"])
-            market = str(row["market"])
+            stock_id = normalize_stock_id(row.get("stock_id"))
+            market = str(row.get("market", ""))
             official_df = official_map.get(stock_id, pd.DataFrame())
             used_source = ""
             write_df = pd.DataFrame()
@@ -3778,11 +3824,12 @@ class DataEngine:
             if not official_df.empty:
                 write_df = official_df.copy()
                 used_source = "official"
-            else:
+            elif self.allow_yahoo_daily_fallback(stock_id, market, len(official_map), total, yahoo_used, max_yahoo=yahoo_limit):
                 yahoo_df = self.download_latest_bar_yahoo(stock_id, market, days="7d")
                 if yahoo_df is not None and not yahoo_df.empty:
                     write_df = yahoo_df.copy()
                     used_source = "yahoo"
+                    yahoo_used += 1
 
             if not write_df.empty:
                 self.db.upsert_price_history(stock_id, write_df)
@@ -3790,22 +3837,23 @@ class DataEngine:
                 rows += actual_rows
                 success += 1
                 source_summary[used_source] += 1
-                if log_cb and (idx % 20 == 0 or idx == total or used_source == "yahoo"):
-                    src_name = "官方" if used_source == "official" else "Yahoo備援"
+                if log_cb and (idx % 50 == 0 or idx == total or used_source == "yahoo"):
+                    src_name = "官方" if used_source == "official" else "Yahoo少量補洞"
                     log_cb(f"[{idx}/{total}] {stock_id} 每日資料更新 {actual_rows} 筆｜來源 {src_name}")
                 if progress_cb:
                     progress_cb(idx, total, stock_id, actual_rows, used_source)
             else:
                 failed += 1
                 source_summary["none"] += 1
-                if log_cb and (idx % 50 == 0 or idx == total):
-                    log_cb(f"[{idx}/{total}] {stock_id} 今日無官方資料，Yahoo 備援亦未取到")
+                if log_cb and (idx % 100 == 0 or idx == total):
+                    log_cb(f"[{idx}/{total}] {stock_id} 官方無資料；Yahoo fallback 已受 Gate 限制或未命中")
                 if progress_cb:
                     progress_cb(idx, total, stock_id, 0, "skip")
 
         if log_cb:
-            log_cb(f"每日更新彙總｜官方 {source_summary['official']} 檔｜Yahoo備援 {source_summary['yahoo']} 檔｜未取到 {source_summary['none']} 檔")
+            log_cb(f"每日更新彙總｜官方 {source_summary['official']} 檔｜Yahoo補洞 {source_summary['yahoo']} 檔｜未取到/跳過 {source_summary['none']} 檔｜official_hit_ratio={official_hit_ratio:.2%}")
         return success, failed, rows
+
     @staticmethod
     def attach(df: pd.DataFrame) -> pd.DataFrame:
         x = df.copy()
@@ -3955,11 +4003,6 @@ class RankingEngine:
         self.db = db
 
     def rebuild(self, progress_cb=None, log_cb=None, cancel_cb=None, rank_mode: str = "fast", allow_external_api: bool = False, allow_eps_build: bool = False, allow_financial_feature_write: bool = False, teacher_mode: str = "light"):
-        rank_mode_norm = str(rank_mode or "fast").lower()
-        if rank_mode_norm == "fast" and (allow_external_api or allow_eps_build or allow_financial_feature_write):
-            raise WorkflowViolation("FAST_RANK_REBUILD 禁止 external_api / eps_build / financial_feature_write")
-        if rank_mode_norm == "fast" and str(teacher_mode or "light").lower() != "light":
-            raise WorkflowViolation("FAST_RANK_REBUILD 只能 teacher_mode=light，不得 full merge")
         master = self.db.get_master()
         today = datetime.now().strftime("%Y-%m-%d")
         rows = []
@@ -4095,6 +4138,17 @@ class RankingEngine:
                 df = finalize_teacher_strategy_fields(df)
         else:
             df = apply_teacher_strategy_pipeline_safe(df, price_history_df=None, context="daily_update_after_ranking", log_cb=log_cb)
+            try:
+                snap_rows = self.db.replace_teacher_strategy_snapshot(df, source_hash=hashlib.md5(pd.util.hash_pandas_object(df[["stock_id", "total_score"]], index=False).values.tobytes()).hexdigest() if "stock_id" in df.columns and "total_score" in df.columns else "")
+                msg = f"[TeacherStrategy][SNAPSHOT_WRITE] rows={snap_rows} context=daily_update_after_ranking"
+                if log_cb:
+                    log_cb(msg)
+                log_info(f"{msg}｜run_id={run_id}")
+            except Exception as exc:
+                warn = f"[TeacherStrategy][SNAPSHOT_WRITE][WARN] skipped: {exc}"
+                if log_cb:
+                    log_cb(warn)
+                log_warning(f"{warn}｜run_id={run_id}")
         self.db.replace_ranking(df)
         self.db.log_system_run(event="ranking_rebuild", status="ok", message=f"ranking rows={len(df)} with FUNDAMENTAL_LOCAL_CACHE", run_id=run_id, module="ranking")
         return len(df)
@@ -9912,7 +9966,7 @@ class AppUI:
         self.worker = None
         self.cancel_event = threading.Event()
         self.current_job = None
-        # V17 WORKFLOW_SPLIT：三流程總閘。strict=False 先以 log 驗收，不中斷既有作業。
+        # V17/V9 WORKFLOW_SPLIT：四流程總閘。strict=True，總閘缺失時不得 fallback 舊流程。
         self.workflow_orchestrator = None
         try:
             if GTCWorkflowOrchestrator is not None:
@@ -9921,12 +9975,12 @@ class AppUI:
                     log_cb=lambda msg: self.ui_call(self.append_log, msg),
                     strict=True,
                 )
-                log_info("[WORKFLOW] Orchestrator initialized in AppUI.__init__｜strict=True")
+                log_info("[WORKFLOW] Orchestrator initialized in AppUI.__init__ strict=True")
             else:
-                log_warning(f"[WORKFLOW] Orchestrator unavailable: {WORKFLOW_ORCHESTRATOR_IMPORT_STATUS}")
+                log_error(f"[WORKFLOW][P0] Orchestrator unavailable: {WORKFLOW_ORCHESTRATOR_IMPORT_STATUS}")
         except Exception as exc:
             self.workflow_orchestrator = None
-            log_warning(f"[WORKFLOW] Orchestrator init failed: {exc}")
+            log_error(f"[WORKFLOW][P0] Orchestrator init failed: {exc}")
         self.top20_snapshot_ttl_sec = 24 * 60 * 60
         self.top20_snapshot_signature = ""
         self.history_batch_size = 25
@@ -10002,53 +10056,6 @@ class AppUI:
 
     def update_status(self, msg: str):
         self.ui_call(self.set_status, msg)
-
-    def _workflow_required_or_abort(self, workflow_name: str) -> bool:
-        """P0：四大流程必須經由 workflow_orchestrator 總閘。
-        若封裝缺檔或 import 失敗，不允許回到舊版 fallback 流程，以免再次混入重覆工作。
-        """
-        if getattr(self, "workflow_orchestrator", None) is not None:
-            return True
-        msg = f"[WORKFLOW][P0][ABORT] {workflow_name} 已停止：workflow_orchestrator 未載入｜{WORKFLOW_ORCHESTRATOR_IMPORT_STATUS}"
-        try:
-            self.ui_call(self.append_log, msg, "ERROR")
-        except Exception:
-            log_error(msg)
-        try:
-            self.ui_call(messagebox.showerror, "Workflow 總閘未載入", msg)
-        except Exception:
-            pass
-        return False
-
-    def _refresh_master_status_only(self):
-        """初始化/建庫後只刷新主檔與狀態，不觸發排行、Teacher、AI TOP20。"""
-        try:
-            self.refresh_filters()
-        except Exception:
-            pass
-        try:
-            self.refresh_classification_summary_ui()
-        except Exception:
-            pass
-        try:
-            self.show_welcome_message()
-        except Exception:
-            pass
-
-    def _refresh_rank_result_only(self):
-        """重建排行後只刷新排行與快照相關 UI，不走 refresh_all_tables。"""
-        try:
-            self._reload_rank_tree_after_rebuild(True)
-        except Exception:
-            pass
-        try:
-            self.refresh_top20_and_order_views()
-        except Exception:
-            pass
-        try:
-            self.refresh_classification_summary_ui()
-        except Exception:
-            pass
 
     def _configure_startup_window(self):
         """啟動時自動貼齊可視區域，避免主視窗超出螢幕範圍。"""
@@ -12840,6 +12847,8 @@ class AppUI:
         self._start_build_history(resume=True)
 
     def _start_build_history(self, resume: bool = False):
+        if not self._workflow_required_or_abort("建立完整歷史"):
+            return
         master = self.db.get_master()
         if master.empty:
             return messagebox.showwarning("提醒", "請先初始化全市場。")
@@ -12862,10 +12871,8 @@ class AppUI:
 
         def worker():
             try:
-                if not self._workflow_required_or_abort("建立完整歷史"):
-                    return
                 self.ui_call(self.clear_log)
-                self.ui_call(self.append_log, f"[WORKFLOW][BUILD_FULL_HISTORY] START｜模式={'續跑' if resume else '一般'}｜主檔 {total} 檔")
+                self.ui_call(self.append_log, f"開始完整建庫，模式={'續跑' if resume else '一般'}，主檔 {total} 檔")
                 self.ui_call(self.set_status, "開始建立完整歷史資料（分批 / 可中斷 / 可續跑）...")
                 self.ui_call(self.start_task, "建立完整歷史", total)
                 self.ui_call(self.update_task, "建立完整歷史", 0, total, 0, 0, 0, "準備中")
@@ -12899,11 +12906,12 @@ class AppUI:
                         log_cb=lambda msg: self.ui_call(self.append_log, msg),
                         cancel_cb=lambda: self.cancel_event.is_set(),
                     )
-                result = self.workflow_orchestrator.build_full_history(
-                    build_history_fn=_build_history_fn,
-                    refresh_ui_fn=lambda **_kw: self.ui_call(self._refresh_master_status_only),
-                )
-                success, failed, rows = result.get("history", (0, 0, 0))
+
+                if hasattr(self.workflow_orchestrator, "build_full_history"):
+                    result = self.workflow_orchestrator.build_full_history(build_history_fn=_build_history_fn)
+                    success, failed, rows = result.get("price_history", (0, 0, 0)) if isinstance(result, dict) else (0, 0, 0)
+                else:
+                    success, failed, rows = _build_history_fn()
                 self.clear_history_state()
                 self.ui_call(self.update_task, "建立完整歷史", total, total, success, failed, 0, "完成")
                 self.ui_call(self.set_status, f"完整歷史建立完成：成功 {success} 檔，失敗 {failed} 檔，寫入 {rows} 筆。")
@@ -12926,6 +12934,8 @@ class AppUI:
         self._run_in_thread(worker, "build_history")
 
     def init_master_data(self):
+        if not self._workflow_required_or_abort("初始化全市場"):
+            return
         master = self.db.get_master()
         if not master.empty and len(master) > 500:
             ok = messagebox.askyesno("確認", f"目前已存在 {len(master)} 檔股票主檔。\n重新初始化將覆蓋現有主檔，是否繼續？")
@@ -12934,35 +12944,25 @@ class AppUI:
 
         def worker():
             try:
-                if not self._workflow_required_or_abort("初始化全市場"):
-                    return
                 self.ui_call(self.set_status, "開始初始化全市場股票清單...")
                 self.ui_call(self.start_task, "初始化全市場", 4)
                 self.ui_call(self.update_task, "初始化全市場", 1, 4, item="抓取主檔")
-
-                def _build_universe_fn(**_kwargs):
-                    return build_full_market_universe()
-
-                def _import_master_fn(universe_df, **_kwargs):
-                    if universe_df is None or getattr(universe_df, "empty", True):
-                        csv_path = resolve_master_csv()
-                        self.db.import_master_csv(csv_path)
-                        return {"source": "local_csv", "path": str(csv_path)}
-                    self.db.import_master_df(universe_df)
-                    return {"source": "official_or_mixed", "rows": len(universe_df)}
-
-                self.workflow_orchestrator.initialize_market(
-                    build_universe_fn=_build_universe_fn,
-                    import_master_fn=_import_master_fn,
-                    classification_qa_fn=lambda **_kw: get_classification_v2_summary(),
-                    refresh_ui_fn=lambda **_kw: self.ui_call(self._refresh_master_status_only),
-                )
-
+                universe = build_full_market_universe()
+                if universe is None or universe.empty:
+                    csv_path = resolve_master_csv()
+                    self.db.import_master_csv(csv_path)
+                    master2 = self.db.get_master()
+                    self.ui_call(self._refresh_master_status_only)
+                    self.ui_call(self.update_task, "初始化全市場", 4, 4, success=1, item="完成")
+                    self.ui_call(self.set_status, f"已改用本地主檔，共 {len(master2)} 檔。")
+                    self.ui_call(messagebox.showinfo, "完成", f"全市場抓取失敗，已改用本地主檔\n共 {len(master2)} 檔\n\n使用主檔：{csv_path}")
+                    return
+                self.db.import_master_df(universe)
                 master2 = self.db.get_master()
                 self.ui_call(self._refresh_master_status_only)
                 self.ui_call(self.update_task, "初始化全市場", 4, 4, success=1, item="完成")
                 self.ui_call(self.set_status, f"全市場初始化完成，共 {len(master2)} 檔。")
-                self.ui_call(messagebox.showinfo, "完成", f"全市場股票清單初始化完成\n共 {len(master2)} 檔\n\n注意：初始化只處理主檔/分類，不會觸發建庫、每日增量或重建排行。")
+                self.ui_call(messagebox.showinfo, "完成", f"全市場股票清單初始化完成\n共 {len(master2)} 檔")
             except Exception as e:
                 traceback.print_exc()
                 self.ui_call(messagebox.showerror, "錯誤", f"初始化失敗：\n{e}")
@@ -13292,7 +13292,165 @@ class AppUI:
         except Exception as exc:
             log_warning(f"老師策略UI刷新略過：{exc}")
 
+    def _workflow_required_or_abort(self, flow_name: str = "重型流程") -> bool:
+        """V9：workflow orchestrator 是 P0 必要模組，缺失時不得 fallback 舊流程。"""
+        if self.workflow_orchestrator is not None:
+            return True
+        msg = f"{flow_name} 已中止：workflow orchestrator 未載入。狀態={WORKFLOW_ORCHESTRATOR_IMPORT_STATUS}"
+        try:
+            self.append_log(f"[WORKFLOW][P0][ABORT] {msg}", "ERROR")
+        except Exception:
+            pass
+        try:
+            messagebox.showerror("Workflow 總閘缺失", msg)
+        except Exception:
+            pass
+        log_error(f"[WORKFLOW][P0][ABORT] {msg}")
+        return False
+
+    def _refresh_master_status_only(self):
+        """初始化全市場後只刷新主檔/分類狀態，不觸發排行、Teacher 或外部資料流程。"""
+        try:
+            self.refresh_filters(True)
+        except Exception:
+            pass
+        try:
+            self.refresh_classification_summary_ui()
+        except Exception as exc:
+            log_warning(f"[WORKFLOW][INIT_MARKET] classification summary refresh skipped: {exc}")
+        try:
+            master = self.db.get_master()
+            self.set_status(f"主檔狀態已刷新，共 {0 if master is None else len(master)} 檔；未執行排行/每日更新。")
+            self.show_welcome_message()
+        except Exception:
+            pass
+
+    def _refresh_analysis_views_only(self, force_full_ranking: bool = True):
+        """V9/V8 回修：只讀 DB/快取刷新所有分析頁，不執行任何重型流程。
+        取代 V6 過度限縮的 _refresh_rank_result_only，也避免回到 refresh_all_tables 的重算副作用。
+        禁止：外部 API、每日增量、完整建庫、EPS build、Teacher full merge。
+        """
+        try:
+            self.refresh_filters(True)
+        except Exception:
+            pass
+        trees = [
+            getattr(self, "dashboard_tree", None), getattr(self, "sop_tree", None),
+            getattr(self, "rotation_tree", None), getattr(self, "rank_tree", None),
+            getattr(self, "sector_tree", None), getattr(self, "theme_tree", None),
+        ]
+        for tree in trees:
+            try:
+                if tree is not None:
+                    for item in tree.get_children():
+                        tree.delete(item)
+            except Exception:
+                pass
+        for tree_name in ("teacher_market_tree", "teacher_rotation_tree", "teacher_lowbase_tree", "teacher_exclude_tree", "teacher_today_tree"):
+            try:
+                tree = getattr(self, tree_name, None)
+                if tree is not None:
+                    self._clear_tree_safe(tree)
+            except Exception:
+                pass
+
+        try:
+            df = self.db.get_latest_ranking()
+            if df is None or df.empty:
+                self.set_status("分析頁刷新：目前沒有 ranking_result 可顯示。")
+                self.show_welcome_message()
+                return
+            df = df.sort_values(["rank_all"]).reset_index(drop=True)
+            if force_full_ranking:
+                try:
+                    self.force_show_full_ranking_once = False
+                except Exception:
+                    pass
+            else:
+                df = self._filtered_ranking(force_full=False)
+            df = self.enrich_price_and_export_fields(df, id_col="stock_id")
+        except Exception as exc:
+            log_exception("_refresh_analysis_views_only::load ranking failed", exc)
+            self.set_status(f"分析頁刷新失敗：{exc}")
+            return
+
+        if df is None or df.empty:
+            self.set_status("分析頁刷新：ranking_result 經篩選後無資料。")
+            return
+
+        try:
+            self._populate_rank_tree(df)
+        except Exception as exc:
+            log_warning(f"[ANALYSIS_REFRESH] rank tree skipped: {exc}")
+
+        try:
+            sector = (df.groupby("industry", as_index=False)
+                      .agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean"))
+                      .sort_values(["avg_total", "avg_ai"], ascending=False))
+            for _, r in sector.iterrows():
+                top_name = df[df["industry"] == r["industry"]].sort_values("total_score", ascending=False).iloc[0]["stock_name"]
+                self.sector_tree.insert("", "end", values=(r["industry"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", top_name))
+        except Exception as exc:
+            log_warning(f"[ANALYSIS_REFRESH] sector refresh skipped: {exc}")
+
+        try:
+            theme = (df.groupby("theme", as_index=False)
+                     .agg(count=("stock_id", "count"), avg_total=("total_score", "mean"), avg_ai=("ai_score", "mean"))
+                     .sort_values(["avg_total", "avg_ai"], ascending=False))
+            for _, r in theme.iterrows():
+                top_name = df[df["theme"] == r["theme"]].sort_values("total_score", ascending=False).iloc[0]["stock_name"]
+                self.theme_tree.insert("", "end", values=(r["theme"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", top_name))
+        except Exception as exc:
+            log_warning(f"[ANALYSIS_REFRESH] theme refresh skipped: {exc}")
+
+        try:
+            regime = self.master_trading_engine.market_engine.get_market_regime()
+            rotation = IndustryRotationEngine.summarize(df)
+            dash_rows = [
+                ("市場狀態", regime.get("regime", "-"), f"Regime score {float(regime.get('score', 0) or 0):.2f}"),
+                ("市場廣度", f"{float(regime.get('breadth', 0) or 0):.1f}", "強勢訊號占比"),
+                ("排行檔數", str(len(df)), "目前股票數"),
+                ("最強題材", str(df.groupby("theme")["total_score"].mean().sort_values(ascending=False).index[0]) if not df.empty else "-", "依平均總分"),
+                ("最強產業", str(rotation.iloc[0]["industry"]) if rotation is not None and not rotation.empty else "-", "依輪動分"),
+            ]
+            for m, v, d in dash_rows:
+                self.dashboard_tree.insert("", "end", values=(m, v, d))
+            if rotation is not None and not rotation.empty:
+                for _, r in rotation.iterrows():
+                    self.rotation_tree.insert("", "end", values=(r["industry"], int(r["count"]), f"{r['avg_total']:.2f}", f"{r['avg_ai']:.2f}", int(r["trend_count"]), f"{r['hot_score']:.2f}", r["rotation"]))
+        except Exception as exc:
+            log_warning(f"[ANALYSIS_REFRESH] dashboard/rotation skipped: {exc}")
+
+        try:
+            trade = self.master_trading_engine.get_trade_pool(df)
+            self.populate_operation_sop(trade["market"], trade["trade_top20"], trade["today_buy"], trade["wait_pullback"], trade["attack"], trade["defense"])
+        except Exception as exc:
+            log_warning(f"[ANALYSIS_REFRESH] trade pool/sop skipped: {exc}")
+
+        try:
+            if (self.last_top20_df is not None and not self.last_top20_df.empty) or (self.last_order_list_df is not None and not self.last_order_list_df.empty):
+                self.refresh_top20_and_order_views()
+        except Exception as exc:
+            log_warning(f"[ANALYSIS_REFRESH] top20/order refresh skipped: {exc}")
+
+        try:
+            self.refresh_teacher_strategy_table(force_rebuild=False)
+        except Exception as exc:
+            log_warning(f"[ANALYSIS_REFRESH] teacher snapshot refresh skipped: {exc}")
+
+        try:
+            self.refresh_classification_summary_ui()
+        except Exception:
+            pass
+        self.set_status(f"分析頁已輕量刷新：排行 {len(df)} 檔；未觸發外部 API / EPS build / full refresh。")
+        try:
+            self.append_log(f"[WORKFLOW][ANALYSIS_REFRESH_ONLY] refreshed ranking/sector/theme/dashboard rows={len(df)}")
+        except Exception:
+            pass
+
     def update_data(self):
+        if not self._workflow_required_or_abort("每日增量更新"):
+            return
         """每日增量更新：唯一重型資料入口（Daily_Update_Master）。
 
         V17 WORKFLOW_SPLIT 原則：
@@ -13310,8 +13468,6 @@ class AppUI:
         def worker():
             workflow_state = {"success": 0, "failed": 0, "rows": 0, "cache_result": {}, "rank_count": 0}
             try:
-                if not self._workflow_required_or_abort("每日增量更新"):
-                    return
                 master = self.db.get_master()
                 total = len(master) if not master.empty else 1
                 counters = {"ok": 0, "fail": 0, "skip": 0}
@@ -13367,11 +13523,16 @@ class AppUI:
                     workflow_state["rank_count"] = rank_count
                     return pd.DataFrame([{"rank_count": rank_count}])
 
-                self.workflow_orchestrator.daily_update_master(
-                    update_price_history_fn=_update_price_history_fn,
-                    sync_external_tables_fn=_sync_external_tables_fn,
-                    rebuild_ranking_from_cache_fn=_rebuild_ranking_after_update_fn,
-                )
+                if self.workflow_orchestrator is not None:
+                    self.workflow_orchestrator.daily_update_master(
+                        update_price_history_fn=_update_price_history_fn,
+                        sync_external_tables_fn=_sync_external_tables_fn,
+                        rebuild_ranking_from_cache_fn=_rebuild_ranking_after_update_fn,
+                    )
+                else:
+                    _update_price_history_fn()
+                    _sync_external_tables_fn()
+                    _rebuild_ranking_after_update_fn()
 
                 success = int(workflow_state.get("success", 0) or 0)
                 failed = int(workflow_state.get("failed", 0) or 0)
@@ -13379,8 +13540,7 @@ class AppUI:
                 cache_result = workflow_state.get("cache_result", {}) or {}
                 rank_count = int(workflow_state.get("rank_count", 0) or 0)
                 self.force_show_full_ranking_once = True
-                self.ui_call(self.refresh_filters, True)
-                self.ui_call(self._refresh_rank_result_only)
+                self.ui_call(self._refresh_analysis_views_only, True)
                 self.ui_call(self.show_welcome_message)
                 self.ui_call(self.append_log, f"[WORKFLOW][Daily_Update_Master] END｜rows={rows}｜features={cache_result.get('feature_rows', 0)}｜ranking={rank_count}")
                 self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，基本面特徵 {cache_result.get('feature_rows', 0)} 筆，排行 {rank_count} 檔。")
@@ -13401,11 +13561,11 @@ class AppUI:
         self._run_in_thread(worker, "update_daily")
 
     def fast_rank_rebuild(self):
+        if not self._workflow_required_or_abort("快速重算排行"):
+            return
         """快速重算排行：只讀快取重算 ranking_result，禁止外部 API / EPS BUILD / financial_feature_daily 寫入。"""
         def worker():
             try:
-                if not self._workflow_required_or_abort("快速重算排行"):
-                    return
                 master = self.db.get_master()
                 total = len(master) if not master.empty else 1
                 self.ui_call(self.clear_log)
@@ -13435,15 +13595,19 @@ class AppUI:
                         teacher_mode="light",
                     )
 
-                result = self.workflow_orchestrator.fast_rank_rebuild(
-                    read_cache_fn=_read_cache_fn,
-                    rebuild_ranking_from_cache_fn=_rebuild_ranking_from_cache_fn,
-                    refresh_ui_fn=lambda *_args, **_kw: True,
-                )
-                count = int(result.get("ranking_df", 0) or 0) if isinstance(result, dict) else 0
+                if self.workflow_orchestrator is not None:
+                    result = self.workflow_orchestrator.fast_rank_rebuild(
+                        read_cache_fn=_read_cache_fn,
+                        rebuild_ranking_from_cache_fn=_rebuild_ranking_from_cache_fn,
+                        refresh_ui_fn=lambda *_args, **_kw: True,
+                    )
+                    count = int(result.get("ranking_df", 0) or 0) if isinstance(result, dict) else 0
+                else:
+                    _read_cache_fn()
+                    count = int(_rebuild_ranking_from_cache_fn() or 0)
 
                 self.force_show_full_ranking_once = True
-                self.ui_call(self._refresh_rank_result_only)
+                self.ui_call(self._refresh_analysis_views_only, True)
                 self.ui_call(self.append_log, f"[WORKFLOW][FAST_RANK_REBUILD] END｜ranking={count}｜禁止EPS BUILD/外部API")
                 self.ui_call(self.finish_task, "快速重算排行", f"快速重算排行已完成，共 {count} 檔")
                 if count <= 0:
