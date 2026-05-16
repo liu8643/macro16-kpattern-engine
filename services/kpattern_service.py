@@ -1,4 +1,4 @@
-KPATTERN_READ_ONLY_GUARD = True  # V17.1: KPattern service must be read-only; no external API / no DB rebuild.
+# V9_WORKFLOW_COMPAT: service must not trigger workflow update/rebuild by itself.
 from kpattern_module.kpattern_pipeline import KPatternPipeline
 
 
