@@ -3955,6 +3955,11 @@ class RankingEngine:
         self.db = db
 
     def rebuild(self, progress_cb=None, log_cb=None, cancel_cb=None, rank_mode: str = "fast", allow_external_api: bool = False, allow_eps_build: bool = False, allow_financial_feature_write: bool = False, teacher_mode: str = "light"):
+        rank_mode_norm = str(rank_mode or "fast").lower()
+        if rank_mode_norm == "fast" and (allow_external_api or allow_eps_build or allow_financial_feature_write):
+            raise WorkflowViolation("FAST_RANK_REBUILD 禁止 external_api / eps_build / financial_feature_write")
+        if rank_mode_norm == "fast" and str(teacher_mode or "light").lower() != "light":
+            raise WorkflowViolation("FAST_RANK_REBUILD 只能 teacher_mode=light，不得 full merge")
         master = self.db.get_master()
         today = datetime.now().strftime("%Y-%m-%d")
         rows = []
@@ -9914,9 +9919,9 @@ class AppUI:
                 self.workflow_orchestrator = GTCWorkflowOrchestrator(
                     logger=APP_LOGGER,
                     log_cb=lambda msg: self.ui_call(self.append_log, msg),
-                    strict=False,
+                    strict=True,
                 )
-                log_info("[WORKFLOW] Orchestrator initialized in AppUI.__init__")
+                log_info("[WORKFLOW] Orchestrator initialized in AppUI.__init__｜strict=True")
             else:
                 log_warning(f"[WORKFLOW] Orchestrator unavailable: {WORKFLOW_ORCHESTRATOR_IMPORT_STATUS}")
         except Exception as exc:
@@ -9997,6 +10002,53 @@ class AppUI:
 
     def update_status(self, msg: str):
         self.ui_call(self.set_status, msg)
+
+    def _workflow_required_or_abort(self, workflow_name: str) -> bool:
+        """P0：四大流程必須經由 workflow_orchestrator 總閘。
+        若封裝缺檔或 import 失敗，不允許回到舊版 fallback 流程，以免再次混入重覆工作。
+        """
+        if getattr(self, "workflow_orchestrator", None) is not None:
+            return True
+        msg = f"[WORKFLOW][P0][ABORT] {workflow_name} 已停止：workflow_orchestrator 未載入｜{WORKFLOW_ORCHESTRATOR_IMPORT_STATUS}"
+        try:
+            self.ui_call(self.append_log, msg, "ERROR")
+        except Exception:
+            log_error(msg)
+        try:
+            self.ui_call(messagebox.showerror, "Workflow 總閘未載入", msg)
+        except Exception:
+            pass
+        return False
+
+    def _refresh_master_status_only(self):
+        """初始化/建庫後只刷新主檔與狀態，不觸發排行、Teacher、AI TOP20。"""
+        try:
+            self.refresh_filters()
+        except Exception:
+            pass
+        try:
+            self.refresh_classification_summary_ui()
+        except Exception:
+            pass
+        try:
+            self.show_welcome_message()
+        except Exception:
+            pass
+
+    def _refresh_rank_result_only(self):
+        """重建排行後只刷新排行與快照相關 UI，不走 refresh_all_tables。"""
+        try:
+            self._reload_rank_tree_after_rebuild(True)
+        except Exception:
+            pass
+        try:
+            self.refresh_top20_and_order_views()
+        except Exception:
+            pass
+        try:
+            self.refresh_classification_summary_ui()
+        except Exception:
+            pass
 
     def _configure_startup_window(self):
         """啟動時自動貼齊可視區域，避免主視窗超出螢幕範圍。"""
@@ -12810,8 +12862,10 @@ class AppUI:
 
         def worker():
             try:
+                if not self._workflow_required_or_abort("建立完整歷史"):
+                    return
                 self.ui_call(self.clear_log)
-                self.ui_call(self.append_log, f"開始完整建庫，模式={'續跑' if resume else '一般'}，主檔 {total} 檔")
+                self.ui_call(self.append_log, f"[WORKFLOW][BUILD_FULL_HISTORY] START｜模式={'續跑' if resume else '一般'}｜主檔 {total} 檔")
                 self.ui_call(self.set_status, "開始建立完整歷史資料（分批 / 可中斷 / 可續跑）...")
                 self.ui_call(self.start_task, "建立完整歷史", total)
                 self.ui_call(self.update_task, "建立完整歷史", 0, total, 0, 0, 0, "準備中")
@@ -12837,13 +12891,19 @@ class AppUI:
                     if idx % 10 == 0 or idx == total_count:
                         self.ui_call(self.set_status, f"建立歷史中 {idx}/{total_count}｜{sid}｜成功 {counters['ok']}｜失敗 {counters['fail']}")
 
-                success, failed, rows = self.data_engine.build_full_history(
-                    batch_size=self.history_batch_size,
-                    sleep_sec=self.history_sleep_sec,
-                    progress_cb=progress,
-                    log_cb=lambda msg: self.ui_call(self.append_log, msg),
-                    cancel_cb=lambda: self.cancel_event.is_set(),
+                def _build_history_fn(**_kwargs):
+                    return self.data_engine.build_full_history(
+                        batch_size=self.history_batch_size,
+                        sleep_sec=self.history_sleep_sec,
+                        progress_cb=progress,
+                        log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                        cancel_cb=lambda: self.cancel_event.is_set(),
+                    )
+                result = self.workflow_orchestrator.build_full_history(
+                    build_history_fn=_build_history_fn,
+                    refresh_ui_fn=lambda **_kw: self.ui_call(self._refresh_master_status_only),
                 )
+                success, failed, rows = result.get("history", (0, 0, 0))
                 self.clear_history_state()
                 self.ui_call(self.update_task, "建立完整歷史", total, total, success, failed, 0, "完成")
                 self.ui_call(self.set_status, f"完整歷史建立完成：成功 {success} 檔，失敗 {failed} 檔，寫入 {rows} 筆。")
@@ -12874,29 +12934,35 @@ class AppUI:
 
         def worker():
             try:
+                if not self._workflow_required_or_abort("初始化全市場"):
+                    return
                 self.ui_call(self.set_status, "開始初始化全市場股票清單...")
                 self.ui_call(self.start_task, "初始化全市場", 4)
                 self.ui_call(self.update_task, "初始化全市場", 1, 4, item="抓取主檔")
-                universe = build_full_market_universe()
-                if universe is None or universe.empty:
-                    csv_path = resolve_master_csv()
-                    self.db.import_master_csv(csv_path)
-                    master2 = self.db.get_master()
-                    self.ui_call(self.refresh_filters)
-                    self.ui_call(self.refresh_all_tables)
-                    self.ui_call(self.refresh_classification_summary_ui)
-                    self.ui_call(self.update_task, "初始化全市場", 4, 4, success=1, item="完成")
-                    self.ui_call(self.set_status, f"已改用本地主檔，共 {len(master2)} 檔。")
-                    self.ui_call(messagebox.showinfo, "完成", f"全市場抓取失敗，已改用本地主檔\n共 {len(master2)} 檔\n\n使用主檔：{csv_path}")
-                    return
-                self.db.import_master_df(universe)
+
+                def _build_universe_fn(**_kwargs):
+                    return build_full_market_universe()
+
+                def _import_master_fn(universe_df, **_kwargs):
+                    if universe_df is None or getattr(universe_df, "empty", True):
+                        csv_path = resolve_master_csv()
+                        self.db.import_master_csv(csv_path)
+                        return {"source": "local_csv", "path": str(csv_path)}
+                    self.db.import_master_df(universe_df)
+                    return {"source": "official_or_mixed", "rows": len(universe_df)}
+
+                self.workflow_orchestrator.initialize_market(
+                    build_universe_fn=_build_universe_fn,
+                    import_master_fn=_import_master_fn,
+                    classification_qa_fn=lambda **_kw: get_classification_v2_summary(),
+                    refresh_ui_fn=lambda **_kw: self.ui_call(self._refresh_master_status_only),
+                )
+
                 master2 = self.db.get_master()
-                self.ui_call(self.refresh_filters)
-                self.ui_call(self.refresh_all_tables)
-                self.ui_call(self.refresh_classification_summary_ui)
+                self.ui_call(self._refresh_master_status_only)
                 self.ui_call(self.update_task, "初始化全市場", 4, 4, success=1, item="完成")
                 self.ui_call(self.set_status, f"全市場初始化完成，共 {len(master2)} 檔。")
-                self.ui_call(messagebox.showinfo, "完成", f"全市場股票清單初始化完成\n共 {len(master2)} 檔")
+                self.ui_call(messagebox.showinfo, "完成", f"全市場股票清單初始化完成\n共 {len(master2)} 檔\n\n注意：初始化只處理主檔/分類，不會觸發建庫、每日增量或重建排行。")
             except Exception as e:
                 traceback.print_exc()
                 self.ui_call(messagebox.showerror, "錯誤", f"初始化失敗：\n{e}")
@@ -13244,6 +13310,8 @@ class AppUI:
         def worker():
             workflow_state = {"success": 0, "failed": 0, "rows": 0, "cache_result": {}, "rank_count": 0}
             try:
+                if not self._workflow_required_or_abort("每日增量更新"):
+                    return
                 master = self.db.get_master()
                 total = len(master) if not master.empty else 1
                 counters = {"ok": 0, "fail": 0, "skip": 0}
@@ -13299,16 +13367,11 @@ class AppUI:
                     workflow_state["rank_count"] = rank_count
                     return pd.DataFrame([{"rank_count": rank_count}])
 
-                if self.workflow_orchestrator is not None:
-                    self.workflow_orchestrator.daily_update_master(
-                        update_price_history_fn=_update_price_history_fn,
-                        sync_external_tables_fn=_sync_external_tables_fn,
-                        rebuild_ranking_from_cache_fn=_rebuild_ranking_after_update_fn,
-                    )
-                else:
-                    _update_price_history_fn()
-                    _sync_external_tables_fn()
-                    _rebuild_ranking_after_update_fn()
+                self.workflow_orchestrator.daily_update_master(
+                    update_price_history_fn=_update_price_history_fn,
+                    sync_external_tables_fn=_sync_external_tables_fn,
+                    rebuild_ranking_from_cache_fn=_rebuild_ranking_after_update_fn,
+                )
 
                 success = int(workflow_state.get("success", 0) or 0)
                 failed = int(workflow_state.get("failed", 0) or 0)
@@ -13317,7 +13380,7 @@ class AppUI:
                 rank_count = int(workflow_state.get("rank_count", 0) or 0)
                 self.force_show_full_ranking_once = True
                 self.ui_call(self.refresh_filters, True)
-                self.ui_call(self.refresh_all_tables, True)
+                self.ui_call(self._refresh_rank_result_only)
                 self.ui_call(self.show_welcome_message)
                 self.ui_call(self.append_log, f"[WORKFLOW][Daily_Update_Master] END｜rows={rows}｜features={cache_result.get('feature_rows', 0)}｜ranking={rank_count}")
                 self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，基本面特徵 {cache_result.get('feature_rows', 0)} 筆，排行 {rank_count} 檔。")
@@ -13341,6 +13404,8 @@ class AppUI:
         """快速重算排行：只讀快取重算 ranking_result，禁止外部 API / EPS BUILD / financial_feature_daily 寫入。"""
         def worker():
             try:
+                if not self._workflow_required_or_abort("快速重算排行"):
+                    return
                 master = self.db.get_master()
                 total = len(master) if not master.empty else 1
                 self.ui_call(self.clear_log)
@@ -13370,21 +13435,15 @@ class AppUI:
                         teacher_mode="light",
                     )
 
-                if self.workflow_orchestrator is not None:
-                    result = self.workflow_orchestrator.fast_rank_rebuild(
-                        read_cache_fn=_read_cache_fn,
-                        rebuild_ranking_from_cache_fn=_rebuild_ranking_from_cache_fn,
-                        refresh_ui_fn=lambda *_args, **_kw: True,
-                    )
-                    count = int(result.get("ranking_df", 0) or 0) if isinstance(result, dict) else 0
-                else:
-                    _read_cache_fn()
-                    count = int(_rebuild_ranking_from_cache_fn() or 0)
+                result = self.workflow_orchestrator.fast_rank_rebuild(
+                    read_cache_fn=_read_cache_fn,
+                    rebuild_ranking_from_cache_fn=_rebuild_ranking_from_cache_fn,
+                    refresh_ui_fn=lambda *_args, **_kw: True,
+                )
+                count = int(result.get("ranking_df", 0) or 0) if isinstance(result, dict) else 0
 
                 self.force_show_full_ranking_once = True
-                self.ui_call(self._reload_rank_tree_after_rebuild, True)
-                self.ui_call(self.refresh_all_tables, True)
-                self.ui_call(self.refresh_classification_summary_ui)
+                self.ui_call(self._refresh_rank_result_only)
                 self.ui_call(self.append_log, f"[WORKFLOW][FAST_RANK_REBUILD] END｜ranking={count}｜禁止EPS BUILD/外部API")
                 self.ui_call(self.finish_task, "快速重算排行", f"快速重算排行已完成，共 {count} 檔")
                 if count <= 0:
