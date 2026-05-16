@@ -1,3 +1,4 @@
+# V9_WORKFLOW_COMPAT: service must not trigger workflow update/rebuild by itself.
 try:
     import pandas as pd
 except Exception:
