@@ -41,6 +41,20 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# V17 WORKFLOW_SPLIT：每日增量更新 / 快速重算排行 / AI TOP20 流程總閘
+try:
+    from gtc_workflow_orchestrator_v17 import (
+        GTCWorkflowOrchestrator,
+        WorkflowViolation,
+        scan_workflow_log_for_violations,
+    )
+    WORKFLOW_ORCHESTRATOR_IMPORT_STATUS = "external_loaded"
+except Exception as _workflow_import_exc:
+    GTCWorkflowOrchestrator = None
+    WorkflowViolation = RuntimeError
+    scan_workflow_log_for_violations = None
+    WORKFLOW_ORCHESTRATOR_IMPORT_STATUS = f"workflow_orchestrator_unavailable: {_workflow_import_exc}"
+
 # Phase 1+：KPattern 模組化安全接入點（FINAL FIX）
 # 說明：
 # 1) 主程式只保留 Hook，不把型態邏輯塞回主程式。
@@ -580,6 +594,7 @@ def get_runtime_dir() -> Path:
 BASE_DIR = get_base_dir()
 RUNTIME_DIR = get_runtime_dir()
 APP_NAME = "GTC AI Trading System v9.6.2 PRO V17-PHASE3_TEACHER_UI_GATE"
+APP_BUILD_TAG = "WORKFLOW_SPLIT_V17_20260516"
 
 # V17-P1 STARTUP_REAL_FIX：2026-05-15
 # 目的：第二次開程式不得再於 MainThread 執行 build_display_columns / EPS MATRIX / AI TOP20 重計算。
@@ -685,6 +700,7 @@ def log_exception(message: str, exc: Exception | None = None):
         pass
 
 SELECTED_PLOT_FONT = configure_matplotlib_cjk_font()
+log_info(f"[BUILD_TAG] {APP_BUILD_TAG}｜workflow_orchestrator={WORKFLOW_ORCHESTRATOR_IMPORT_STATUS}")
 log_info(f"[STARTUP_REAL_FIX] active={STARTUP_REAL_FIX_ID}｜display_schema_warning=OFF｜startup_light_no_build_display=ON")
 
 
@@ -3938,7 +3954,7 @@ class RankingEngine:
     def __init__(self, db: DBManager):
         self.db = db
 
-    def rebuild(self, progress_cb=None, log_cb=None, cancel_cb=None):
+    def rebuild(self, progress_cb=None, log_cb=None, cancel_cb=None, rank_mode: str = "fast", allow_external_api: bool = False, allow_eps_build: bool = False, allow_financial_feature_write: bool = False, teacher_mode: str = "light"):
         master = self.db.get_master()
         today = datetime.now().strftime("%Y-%m-%d")
         rows = []
@@ -3949,7 +3965,12 @@ class RankingEngine:
         # V9.6.2 FUNDAMENTAL_LOCAL_CACHE：Ranking 不再負責下載或重建 EPS Matrix。
         # 正確流程：每日增量更新先同步 external_valuation / external_revenue，再寫入 financial_feature_daily；
         # 重排行只讀本地 financial_feature_daily，避免每次排行時即時抓網路或產生 E_NA-R_NA 假評分。
-        run_id = self.db.log_system_run(event="ranking_rebuild", status="start", message="Ranking rebuild reads local financial_feature_daily only", module="ranking")
+        run_id = self.db.log_system_run(event="ranking_rebuild", status="start", message=f"Ranking rebuild mode={rank_mode}; allow_external_api={allow_external_api}; allow_eps_build={allow_eps_build}; allow_financial_feature_write={allow_financial_feature_write}; teacher_mode={teacher_mode}", module="ranking")
+        if str(rank_mode).lower() == "fast":
+            msg = "[WORKFLOW][FAST_RANK_REBUILD] fast mode active｜禁止 external API / EPS BUILD / financial_feature_daily write / Teacher full merge"
+            if log_cb:
+                log_cb(msg)
+            log_info(f"{msg}｜run_id={run_id}")
         feature_df = self.db.get_latest_financial_features()
         feature_map = {}
         if feature_df is not None and not feature_df.empty and "stock_id" in feature_df.columns:
@@ -4037,7 +4058,38 @@ class RankingEngine:
         df["rank_all"] = np.arange(1, len(df) + 1)
         merged = df.merge(master[["stock_id", "industry"]], on="stock_id", how="left")
         df["rank_industry"] = merged.groupby("industry")["total_score"].rank(method="dense", ascending=False).astype(int)
-        df = apply_teacher_strategy_pipeline_safe(df, price_history_df=None, context="ranking_rebuild", log_cb=log_cb)
+        if str(rank_mode).lower() == "fast" or str(teacher_mode).lower() == "light":
+            # V17 WORKFLOW_SPLIT：快速重算排行只允許 Teacher Snapshot 輕量合併，禁止 full merge。
+            try:
+                teacher_snap = self.db.get_latest_teacher_strategy_snapshot()
+                light_cols = [
+                    "stock_id", "teacher_score", "teacher_final_decision", "teacher_light",
+                    "teacher_ui_bucket", "teacher_priority", "teacher_no_trade_reason",
+                    "teacher_trade_allowed", "position_stage", "position_score", "weak_gate",
+                    "weak_score", "rotation", "sector_strength_score", "flow_score", "rs_score",
+                ]
+                if teacher_snap is not None and not teacher_snap.empty and "stock_id" in teacher_snap.columns:
+                    keep_cols = [c for c in light_cols if c in teacher_snap.columns]
+                    drop_cols = [c for c in keep_cols if c != "stock_id" and c in df.columns]
+                    if drop_cols:
+                        df = df.drop(columns=drop_cols, errors="ignore")
+                    df = df.merge(teacher_snap[keep_cols].drop_duplicates(subset=["stock_id"], keep="last"), on="stock_id", how="left")
+                    df = finalize_teacher_strategy_fields(df)
+                    msg = f"[TeacherStrategy][LIGHT_MERGE] fast rank uses teacher_strategy_snapshot rows={len(teacher_snap)} merge_cols={len(keep_cols)}"
+                else:
+                    df = finalize_teacher_strategy_fields(df)
+                    msg = "[TeacherStrategy][LIGHT_MERGE] teacher_strategy_snapshot empty; fallback default teacher fields"
+                if log_cb:
+                    log_cb(msg)
+                log_info(f"{msg}｜run_id={run_id}")
+            except Exception as exc:
+                warn = f"[TeacherStrategy][LIGHT_MERGE][WARN] fallback to default teacher fields: {exc}"
+                if log_cb:
+                    log_cb(warn)
+                log_warning(f"{warn}｜run_id={run_id}")
+                df = finalize_teacher_strategy_fields(df)
+        else:
+            df = apply_teacher_strategy_pipeline_safe(df, price_history_df=None, context="daily_update_after_ranking", log_cb=log_cb)
         self.db.replace_ranking(df)
         self.db.log_system_run(event="ranking_rebuild", status="ok", message=f"ranking rows={len(df)} with FUNDAMENTAL_LOCAL_CACHE", run_id=run_id, module="ranking")
         return len(df)
@@ -9855,6 +9907,21 @@ class AppUI:
         self.worker = None
         self.cancel_event = threading.Event()
         self.current_job = None
+        # V17 WORKFLOW_SPLIT：三流程總閘。strict=False 先以 log 驗收，不中斷既有作業。
+        self.workflow_orchestrator = None
+        try:
+            if GTCWorkflowOrchestrator is not None:
+                self.workflow_orchestrator = GTCWorkflowOrchestrator(
+                    logger=APP_LOGGER,
+                    log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                    strict=False,
+                )
+                log_info("[WORKFLOW] Orchestrator initialized in AppUI.__init__")
+            else:
+                log_warning(f"[WORKFLOW] Orchestrator unavailable: {WORKFLOW_ORCHESTRATOR_IMPORT_STATUS}")
+        except Exception as exc:
+            self.workflow_orchestrator = None
+            log_warning(f"[WORKFLOW] Orchestrator init failed: {exc}")
         self.top20_snapshot_ttl_sec = 24 * 60 * 60
         self.top20_snapshot_signature = ""
         self.history_batch_size = 25
@@ -10046,7 +10113,7 @@ class AppUI:
         # V17-R2：啟動/刷新畫面不允許自動重建排行；只有使用者明確執行功能時才 auto_rebuild。
         if auto_rebuild and self.db.get_total_price_rows() > 0:
             try:
-                count = self.rank_engine.rebuild()
+                count = self.rank_engine.rebuild(rank_mode="fast", allow_external_api=False, allow_eps_build=False, allow_financial_feature_write=False, teacher_mode="light")
                 return count > 0
             except Exception:
                 return False
@@ -10108,6 +10175,7 @@ class AppUI:
             "建立完整歷史（一次）",
             "續跑建庫",
             "每日增量更新",
+            "快速重算排行",
             "重建排行",
             "更新分類檔",
             "外部資料監控中心",
@@ -10726,7 +10794,8 @@ class AppUI:
             "建立完整歷史（一次）": self.build_full_history_once,
             "續跑建庫": self.resume_full_history,
             "每日增量更新": self.update_data,
-            "重建排行": self.rebuild_ranking,
+            "快速重算排行": self.fast_rank_rebuild,
+            "重建排行": self.fast_rank_rebuild,
             "更新分類檔": self.update_classification_book,
             "外部資料監控中心": self.show_external_data_center,
             "同步外部資料": self.sync_external_data,
@@ -13158,6 +13227,13 @@ class AppUI:
             log_warning(f"老師策略UI刷新略過：{exc}")
 
     def update_data(self):
+        """每日增量更新：唯一重型資料入口（Daily_Update_Master）。
+
+        V17 WORKFLOW_SPLIT 原則：
+        - 只有這裡允許外部 API、price_history 寫入、financial_feature_daily 建立、EPS Matrix/基本面快取、Teacher full merge。
+        - 完成後可順便產出 ranking_result 與 teacher snapshot。
+        - 重建排行 / AI TOP20 不得再偷偷進入本流程。
+        """
         last_date = self.db.get_last_price_date()
         today = datetime.now().strftime("%Y-%m-%d")
         if last_date == today:
@@ -13166,11 +13242,13 @@ class AppUI:
                 return
 
         def worker():
+            workflow_state = {"success": 0, "failed": 0, "rows": 0, "cache_result": {}, "rank_count": 0}
             try:
                 master = self.db.get_master()
                 total = len(master) if not master.empty else 1
                 counters = {"ok": 0, "fail": 0, "skip": 0}
                 self.ui_call(self.clear_log)
+                self.ui_call(self.append_log, f"[WORKFLOW][Daily_Update_Master] START｜BUILD_TAG={APP_BUILD_TAG}")
                 self.ui_call(self.start_task, "每日增量更新", total)
 
                 def progress(idx, total_count, sid, row_count, flag):
@@ -13182,28 +13260,66 @@ class AppUI:
                         counters["skip"] += 1
                     self.ui_call(self.update_task, "每日增量更新", idx, total_count, counters["ok"], counters["fail"], counters["skip"], sid)
 
-                success, failed, rows = self.data_engine.update_incremental(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
+                def _update_price_history_fn(**_kwargs):
+                    success, failed, rows = self.data_engine.update_incremental(
+                        progress_cb=progress,
+                        log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                        cancel_cb=lambda: self.cancel_event.is_set(),
+                    )
+                    workflow_state.update({"success": success, "failed": failed, "rows": rows})
+                    return pd.DataFrame([{"success": success, "failed": failed, "rows": rows}])
 
-                # V9.6.2 FUNDAMENTAL_LOCAL_CACHE：每日更新完成後先同步基本面本地快取，再重排行。
-                # 順序固定為：行情 → external_valuation/external_revenue → financial_feature_daily → ranking_result。
-                self.ui_call(self.append_log, "[FUNDAMENTAL CACHE] 每日行情更新完成，開始同步 market_snapshot + EPS/估值 + 月營收本地快取")
-                cache_result = ExternalDataFetcher(self.db).sync_fundamental_local_cache(
-                    modules=["market_snapshot", "valuation", "revenue"],
-                    log_cb=lambda msg: self.ui_call(self.append_log, msg),
-                )
-                if float(cache_result.get("ne_ratio", 1.0) or 1.0) >= 0.80:
-                    self.ui_call(self.append_log, f"[FUNDAMENTAL CACHE][WARNING] financial_feature_daily NE_ratio={cache_result.get('ne_ratio', 1.0):.2%}，排行會標示基本面資料不足。")
+                def _sync_external_tables_fn(**_kwargs):
+                    self.ui_call(self.append_log, "[FUNDAMENTAL CACHE] 每日行情更新完成，開始同步 market_snapshot + EPS/估值 + 月營收本地快取")
+                    cache_result = ExternalDataFetcher(self.db).sync_fundamental_local_cache(
+                        modules=["market_snapshot", "valuation", "revenue"],
+                        log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                    )
+                    workflow_state["cache_result"] = cache_result or {}
+                    if float((cache_result or {}).get("ne_ratio", 1.0) or 1.0) >= 0.80:
+                        self.ui_call(self.append_log, f"[FUNDAMENTAL CACHE][WARNING] financial_feature_daily NE_ratio={(cache_result or {}).get('ne_ratio', 1.0):.2%}，排行會標示基本面資料不足。")
+                    return pd.DataFrame([cache_result or {}])
 
-                self.ui_call(self.start_task, "重建排行", total)
-                rank_skip = {"skip": 0}
-                def rank_progress(idx, total_count, sid, ok_count, fail_count, skip_count, flag):
-                    rank_skip["skip"] = skip_count
-                    self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
-                rank_count = self.rank_engine.rebuild(progress_cb=rank_progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
+                def _rebuild_ranking_after_update_fn(**_kwargs):
+                    self.ui_call(self.start_task, "每日更新後產出排行", total)
+                    rank_skip = {"skip": 0}
+                    def rank_progress(idx, total_count, sid, ok_count, fail_count, skip_count, flag):
+                        rank_skip["skip"] = skip_count
+                        self.ui_call(self.update_task, "每日更新後產出排行", idx, total_count, ok_count, fail_count, skip_count, sid)
+                    rank_count = self.rank_engine.rebuild(
+                        progress_cb=rank_progress,
+                        log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                        cancel_cb=lambda: self.cancel_event.is_set(),
+                        rank_mode="daily_after_update",
+                        allow_external_api=False,
+                        allow_eps_build=True,
+                        allow_financial_feature_write=False,
+                        teacher_mode="full",
+                    )
+                    workflow_state["rank_count"] = rank_count
+                    return pd.DataFrame([{"rank_count": rank_count}])
+
+                if self.workflow_orchestrator is not None:
+                    self.workflow_orchestrator.daily_update_master(
+                        update_price_history_fn=_update_price_history_fn,
+                        sync_external_tables_fn=_sync_external_tables_fn,
+                        rebuild_ranking_from_cache_fn=_rebuild_ranking_after_update_fn,
+                    )
+                else:
+                    _update_price_history_fn()
+                    _sync_external_tables_fn()
+                    _rebuild_ranking_after_update_fn()
+
+                success = int(workflow_state.get("success", 0) or 0)
+                failed = int(workflow_state.get("failed", 0) or 0)
+                rows = int(workflow_state.get("rows", 0) or 0)
+                cache_result = workflow_state.get("cache_result", {}) or {}
+                rank_count = int(workflow_state.get("rank_count", 0) or 0)
                 self.force_show_full_ranking_once = True
                 self.ui_call(self.refresh_filters, True)
                 self.ui_call(self.refresh_all_tables, True)
                 self.ui_call(self.show_welcome_message)
+                self.ui_call(self.append_log, f"[WORKFLOW][Daily_Update_Master] END｜rows={rows}｜features={cache_result.get('feature_rows', 0)}｜ranking={rank_count}")
                 self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，基本面特徵 {cache_result.get('feature_rows', 0)} 筆，排行 {rank_count} 檔。")
                 self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n基本面特徵 {cache_result.get('feature_rows', 0)} 筆\n排行 {rank_count} 檔\n（行情 + EPS/估值 + 月營收已先寫入本地DB）")
             except OperationCancelled:
@@ -13215,44 +13331,77 @@ class AppUI:
                     pool_audit = getattr(self.master_trading_engine, "last_pool_audit", {}) or {}
                     if pool_audit:
                         self.ui_call(self.append_log, f"[POOL-AUDIT-LAST] candidate20={pool_audit.get('candidate20_count','-')}｜core_attack5={pool_audit.get('core_attack5_count','-')}｜today_buy={pool_audit.get('today_buy_count','-')}｜execution_ready={pool_audit.get('execution_ready_count','-')}｜unique_decision={pool_audit.get('unique_decision_count','-')}")
-                        if pool_audit.get('core_minus_candidate20'):
-                            self.ui_call(self.append_log, f"[POOL-AUDIT-LAST] core_attack5 - candidate20：{','.join(pool_audit.get('core_minus_candidate20', [])[:20])}")
-                        if pool_audit.get('today_minus_core'):
-                            self.ui_call(self.append_log, f"[POOL-AUDIT-LAST] today_buy - core_attack5：{','.join(pool_audit.get('today_minus_core', [])[:20])}")
-                        if pool_audit.get('unique_minus_core'):
-                            self.ui_call(self.append_log, f"[POOL-AUDIT-LAST] unique_decision - core_attack5：{','.join(pool_audit.get('unique_minus_core', [])[:20])}")
                 except Exception:
                     pass
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
 
         self._run_in_thread(worker, "update_daily")
 
-    def rebuild_ranking(self):
+    def fast_rank_rebuild(self):
+        """快速重算排行：只讀快取重算 ranking_result，禁止外部 API / EPS BUILD / financial_feature_daily 寫入。"""
         def worker():
             try:
                 master = self.db.get_master()
                 total = len(master) if not master.empty else 1
                 self.ui_call(self.clear_log)
-                self.ui_call(self.start_task, "重建排行", total)
+                self.ui_call(self.append_log, f"[WORKFLOW][FAST_RANK_REBUILD] START｜BUILD_TAG={APP_BUILD_TAG}")
+                self.ui_call(self.start_task, "快速重算排行", total)
+
                 def progress(idx, total_count, sid, ok_count, fail_count, skip_count, flag):
-                    self.ui_call(self.update_task, "重建排行", idx, total_count, ok_count, fail_count, skip_count, sid)
-                count = self.rank_engine.rebuild(progress_cb=progress, log_cb=lambda msg: self.ui_call(self.append_log, msg), cancel_cb=lambda: self.cancel_event.is_set())
+                    self.ui_call(self.update_task, "快速重算排行", idx, total_count, ok_count, fail_count, skip_count, sid)
+
+                def _read_cache_fn(**_kwargs):
+                    latest_rank = self.db.get_latest_ranking()
+                    latest_feature = self.db.get_latest_financial_features()
+                    teacher_snap = self.db.get_latest_teacher_strategy_snapshot()
+                    msg = f"[WORKFLOW][FAST_RANK_REBUILD] read_cache｜ranking={0 if latest_rank is None else len(latest_rank)}｜financial_feature={0 if latest_feature is None else len(latest_feature)}｜teacher_snapshot={0 if teacher_snap is None else len(teacher_snap)}"
+                    self.ui_call(self.append_log, msg)
+                    return pd.DataFrame([{"ranking_rows": 0 if latest_rank is None else len(latest_rank), "feature_rows": 0 if latest_feature is None else len(latest_feature), "teacher_rows": 0 if teacher_snap is None else len(teacher_snap)}])
+
+                def _rebuild_ranking_from_cache_fn(**_kwargs):
+                    return self.rank_engine.rebuild(
+                        progress_cb=progress,
+                        log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                        cancel_cb=lambda: self.cancel_event.is_set(),
+                        rank_mode="fast",
+                        allow_external_api=False,
+                        allow_eps_build=False,
+                        allow_financial_feature_write=False,
+                        teacher_mode="light",
+                    )
+
+                if self.workflow_orchestrator is not None:
+                    result = self.workflow_orchestrator.fast_rank_rebuild(
+                        read_cache_fn=_read_cache_fn,
+                        rebuild_ranking_from_cache_fn=_rebuild_ranking_from_cache_fn,
+                        refresh_ui_fn=lambda *_args, **_kw: True,
+                    )
+                    count = int(result.get("ranking_df", 0) or 0) if isinstance(result, dict) else 0
+                else:
+                    _read_cache_fn()
+                    count = int(_rebuild_ranking_from_cache_fn() or 0)
+
                 self.force_show_full_ranking_once = True
                 self.ui_call(self._reload_rank_tree_after_rebuild, True)
                 self.ui_call(self.refresh_all_tables, True)
                 self.ui_call(self.refresh_classification_summary_ui)
-                self.ui_call(self.finish_task, "重建排行", f"排行已完成，共 {count} 檔")
+                self.ui_call(self.append_log, f"[WORKFLOW][FAST_RANK_REBUILD] END｜ranking={count}｜禁止EPS BUILD/外部API")
+                self.ui_call(self.finish_task, "快速重算排行", f"快速重算排行已完成，共 {count} 檔")
                 if count <= 0:
-                    self.ui_call(messagebox.showwarning, "提醒", "排行重建完成，但目前可計算檔數為 0。\n請先建立至少 70 根以上歷史K線資料。")
+                    self.ui_call(messagebox.showwarning, "提醒", "快速重算完成，但目前可計算檔數為 0。\n請先建立至少 70 根以上歷史K線資料，並先跑每日增量更新。")
                 else:
-                    self.ui_call(messagebox.showinfo, "完成", f"排行已完成，共 {count} 檔")
+                    self.ui_call(messagebox.showinfo, "完成", f"快速重算排行已完成，共 {count} 檔")
             except OperationCancelled:
-                self.ui_call(self.finish_task, "重建排行", "重建排行已中斷")
+                self.ui_call(self.finish_task, "快速重算排行", "快速重算排行已中斷")
             except Exception as e:
                 traceback.print_exc()
                 self.ui_call(messagebox.showerror, "錯誤", str(e))
 
-        self._run_in_thread(worker, "rebuild_rank")
+        self._run_in_thread(worker, "fast_rank_rebuild")
+
+    def rebuild_ranking(self):
+        """舊按鈕相容：導向快速重算排行，不再執行舊版重建排行流程。"""
+        return self.fast_rank_rebuild()
 
     def _ensure_external_data_ready_auto_sync(self, context: str = "AI選股TOP20") -> tuple[int, str]:
         """V9.5.1：TOP20前置條件自動補救。
@@ -13430,157 +13579,114 @@ class AppUI:
             log_warning(f"[AI TOP20][SNAPSHOT LOAD][WARN] {exc}")
             return False
 
-    def show_top20(self):
-        if not self.ensure_ranking_ready(auto_rebuild=True):
-            return messagebox.showwarning("提醒", "目前尚無可用排行資料，請先建立歷史資料後重建排行。")
-        df = self._filtered_ranking()
-        if df.empty:
-            try:
-                full_df = self.db.get_latest_ranking()
-                if full_df is not None and not full_df.empty:
-                    df = self.enrich_price_and_export_fields(full_df.sort_values(["rank_all"]).reset_index(drop=True), id_col="stock_id")
-                    self.set_status("目前篩選條件無資料，AI選股TOP20 已改用完整排行執行。")
-                else:
-                    return messagebox.showwarning("提醒", "目前沒有可用排行資料")
-            except Exception:
-                return messagebox.showwarning("提醒", "目前篩選條件下沒有可用資料")
-
-        signature = self._top20_snapshot_signature(df)
-        if self._load_ai_top20_snapshot(signature):
-            self.clear_log()
-            self.append_log("[AI TOP20][SNAPSHOT LOAD] 命中今日快照，直接載入TOP20；未重跑EPS MATRIX/2080檔AI選股。")
-            self.refresh_top20_and_order_views()
-            self.left_notebook.select(self.tab_top20)
-            self.open_three_windows()
-            self.set_status("AI選股TOP20已由今日快照載入，未重算。")
-            return
-
-        def worker():
-            try:
-                total = len(df)
-                self.ui_call(self.clear_log)
-                self.ui_call(self.start_task, "AI選股TOP20", total)
-
-                auto_ready, auto_reason = self._ensure_external_data_ready_auto_sync("AI選股TOP20")
-                if int(auto_ready) != 1:
-                    self.ui_call(self.append_log, "[V9.5.9-SOFT-BLOCK] 外部資料自動同步後仍未完整，但不停止AI分析/TOP20；execution_ready僅作資訊欄位。原因：" + str(auto_reason), "WARNING")
-                    self.ui_call(self.set_status, "AI選股TOP20繼續執行；外部資料未完整僅顯示SOFT_BLOCK提示")
-
-
-                def progress(idx, total_count, sid):
-                    self.ui_call(self.update_task, "AI選股TOP20", idx, total_count, idx, 0, 0, sid)
-
-                trade = self.master_trading_engine.get_trade_pool(
-                    df,
-                    progress_cb=progress,
-                    log_cb=lambda msg: self.ui_call(self.append_log, msg),
-                    cancel_cb=lambda: self.cancel_event.is_set(),
-                )
-                market = trade["market"]
-                trade_top20 = trade["trade_top20"]
-                tradable_top20 = trade.get("tradable_top20", pd.DataFrame())
-                self.last_candidate_top20_df = self.enrich_price_and_export_fields(trade_top20.copy(), id_col="stock_id") if trade_top20 is not None and not trade_top20.empty else pd.DataFrame()
-                attack = trade["attack"]
-                watch = trade["watch"]
-                defense = trade["defense"]
-                today_buy = trade["today_buy"]
-                wait_pullback = trade["wait_pullback"]
-                theme_summary = trade["theme_summary"]
-                eliminated = trade.get("eliminated", pd.DataFrame())
-
-                ui_top20_source = trade_top20 if trade_top20 is not None and not trade_top20.empty else tradable_top20
-                self.last_top20_df = self.enrich_price_and_export_fields(ui_top20_source.copy(), id_col="stock_id") if ui_top20_source is not None and not ui_top20_source.empty else pd.DataFrame()
-                self.cache_trade_dataframe(self.last_top20_df)
-                top5 = attack.head(5).copy() if attack is not None and not attack.empty else (trade_top20.head(5).copy() if trade_top20 is not None and not trade_top20.empty else pd.DataFrame())
-                if not top5.empty:
-                    bt_rows = []
-                    for _, rr in top5.iterrows():
-                        bt = self.backtest_engine.estimate_trade_quality(str(rr["stock_id"]))
-                        bt_rows.append(bt)
-                    bt_df = pd.DataFrame(bt_rows)
-                    top5 = pd.concat([top5.reset_index(drop=True), bt_df.reset_index(drop=True)], axis=1)
-                self.last_top5_df = self.enrich_price_and_export_fields(top5.copy(), id_col="stock_id")
-                self.cache_trade_dataframe(self.last_top5_df)
-                self.cache_backtest_dataframe(self.last_top5_df)
-                self.last_attack_df = self.enrich_price_and_export_fields(attack.copy(), id_col="stock_id")
-                self.cache_trade_dataframe(self.last_attack_df)
-                self.last_watch_df = self.enrich_price_and_export_fields(watch.copy(), id_col="stock_id")
-                self.cache_trade_dataframe(self.last_watch_df)
-                self.last_defense_df = self.enrich_price_and_export_fields(defense.copy(), id_col="stock_id")
-                self.cache_trade_dataframe(self.last_defense_df)
-                self.last_theme_summary_df = theme_summary.copy()
-                self.last_today_buy_df = self.enrich_price_and_export_fields(today_buy.copy(), id_col="stock_id")
-                self.cache_trade_dataframe(self.last_today_buy_df)
-                self.last_wait_df = self.enrich_price_and_export_fields(wait_pullback.copy(), id_col="stock_id")
-                self.cache_trade_dataframe(self.last_wait_df)
-                self.last_order_list_df = self.normalize_order_df(self.build_order_list(self.last_today_buy_df))
-                inst_plan_raw = self.portfolio_engine.build_institutional_plan(self.last_today_buy_df.copy())
-                self.last_institutional_plan_df = self.normalize_institutional_df(self.enrich_price_and_export_fields(inst_plan_raw, id_col="代號"))
-                unique_raw = trade.get("unique_decision", pd.DataFrame())
-                if unique_raw is not None and not unique_raw.empty:
-                    self.last_unique_decision_df = self.enrich_price_and_export_fields(unique_raw.copy(), id_col="stock_id").head(REPORT_DECISION_LIMITS["unique_decision"])
-                else:
-                    self.last_unique_decision_df = pd.DataFrame()
-
-                assert_phase1_report_consistency(
-                    self.last_top20_df,
-                    self.last_attack_df,
-                    self.last_today_buy_df,
-                    self.last_wait_df,
-                    self.last_watch_df,
-                    self.last_unique_decision_df,
-                    self.last_order_list_df,
-                    self.last_institutional_plan_df,
-                )
-
-                self.ui_call(self.populate_operation_sop, market, trade_top20, today_buy, wait_pullback, attack, defense)
-                self.ui_call(self.refresh_top20_and_order_views)
-                self.ui_call(self.left_notebook.select, self.tab_top20)
-                self.ui_call(self.open_three_windows)
-
-                defend_cnt = int(trade_top20["bucket"].eq("防守").sum()) if not trade_top20.empty else 0
-                eliminated_cnt = len(eliminated) if eliminated is not None else 0
-                lines = [
-                    "《v9.5 EXTERNAL DECISION INTEGRATED 操作版》",
-                    f"市場判斷：{market['regime']}（{market['score']:.2f}）｜市場廣度 {market['breadth']:.1f}",
-                    f"市場說明：{market['memo']}",
-                    f"TOP20 觀察池：{len(trade_top20)} 檔｜今日可下單：{len(today_buy)}｜條件預掛：{len(wait_pullback)}｜防守：{defend_cnt}｜淘汰：{eliminated_cnt}",
-                    f"交易門檻：{STRATEGY_CONFIG_MANAGER.summary_text()}",
-                    "操作用途：先看今日可下單，再看條件預掛，沒有進場區就不下單。",
-                    "",
-                    "【TOP20 觀察池 前5檔】",
+    def _read_top20_snapshot_for_view(self, top_n: int = 20, **_kwargs):
+        """AI TOP20 純讀快照：只讀 ranking_result / teacher_strategy_snapshot，不觸發任何重算。"""
+        ranking = self.db.get_latest_ranking()
+        if ranking is None or ranking.empty:
+            return pd.DataFrame()
+        x = ranking.copy()
+        if "rank_all" in x.columns:
+            x = x.sort_values(["rank_all"]).reset_index(drop=True)
+        else:
+            x = x.sort_values(["total_score"], ascending=False).reset_index(drop=True)
+        x = x.head(int(top_n or 20)).copy()
+        try:
+            teacher = self.db.get_latest_teacher_strategy_snapshot()
+            if teacher is not None and not teacher.empty and "stock_id" in teacher.columns:
+                light_cols = [
+                    "stock_id", "teacher_score", "teacher_final_decision", "teacher_light",
+                    "teacher_ui_bucket", "teacher_priority", "teacher_no_trade_reason",
+                    "teacher_trade_allowed", "position_stage", "position_score", "weak_gate",
+                    "weak_score", "rotation", "sector_strength_score", "flow_score", "rs_score",
                 ]
-                if trade_top20.empty:
-                    lines.append("目前無符合條件標的")
-                else:
-                    for i, (_, r) in enumerate(trade_top20.head(REPORT_DECISION_LIMITS["core_attack5"]).iterrows(), start=1):
-                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['bucket']}｜{r.get('liquidity_status','-')} {float(r.get('liquidity_score',0) or 0):.1f}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%")
+                keep_cols = [c for c in light_cols if c in teacher.columns]
+                drop_cols = [c for c in keep_cols if c != "stock_id" and c in x.columns]
+                if drop_cols:
+                    x = x.drop(columns=drop_cols, errors="ignore")
+                x = x.merge(teacher[keep_cols].drop_duplicates(subset=["stock_id"], keep="last"), on="stock_id", how="left")
+                x = finalize_teacher_strategy_fields(x)
+        except Exception as exc:
+            log_warning(f"[AI_TOP20_VIEW] teacher snapshot merge skipped: {exc}")
+        try:
+            x = self.enrich_price_and_export_fields(x, id_col="stock_id")
+        except Exception as exc:
+            log_warning(f"[AI_TOP20_VIEW] enrich display fields skipped: {exc}")
+        return x
 
-                lines.extend(["", "【今日可下單】"])
-                if today_buy.empty:
-                    lines.append("今日無符合 SOP 的可買名單（允許空白，不為湊數放寬）。")
-                else:
-                    for i, (_, r) in enumerate(today_buy.iterrows(), start=1):
-                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜{r['trade_action']}｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
+    def _render_top20_snapshot_view(self, top20_df, **_kwargs):
+        if top20_df is None or top20_df.empty:
+            messagebox.showwarning("提醒", "目前沒有 AI TOP20 快照資料。請先執行『每日增量更新』產生 ranking_result。")
+            return False
+        df = top20_df.copy()
+        self.last_top20_df = df
+        self.last_candidate_top20_df = df.copy()
+        self.last_top5_df = df.head(5).copy()
+        self.last_attack_df = df.head(5).copy()
+        try:
+            if "teacher_trade_allowed" in df.columns:
+                self.last_today_buy_df = df[pd.to_numeric(df["teacher_trade_allowed"], errors="coerce").fillna(0).astype(int).eq(1)].copy()
+            elif "action" in df.columns:
+                self.last_today_buy_df = df[df["action"].astype(str).str.contains("買|BUY", case=False, na=False)].copy()
+            else:
+                self.last_today_buy_df = pd.DataFrame()
+        except Exception:
+            self.last_today_buy_df = pd.DataFrame()
+        self.last_wait_df = pd.DataFrame()
+        self.last_watch_df = df.copy()
+        self.last_defense_df = pd.DataFrame()
+        self.last_theme_summary_df = pd.DataFrame()
+        try:
+            self.last_order_list_df = self.normalize_order_df(self.build_order_list(self.last_today_buy_df)) if self.last_today_buy_df is not None and not self.last_today_buy_df.empty else pd.DataFrame()
+        except Exception:
+            self.last_order_list_df = pd.DataFrame()
+        self.last_institutional_plan_df = pd.DataFrame()
+        self.last_unique_decision_df = df.head(REPORT_DECISION_LIMITS.get("unique_decision", 20)).copy()
+        self.cache_trade_dataframe(self.last_top20_df)
+        self.cache_trade_dataframe(self.last_top5_df)
+        self.cache_trade_dataframe(self.last_today_buy_df)
+        self.cache_backtest_dataframe(self.last_top5_df)
+        self.refresh_top20_and_order_views()
+        self.left_notebook.select(self.tab_top20)
+        self.open_three_windows()
+        lines = [
+            "《AI選股TOP20｜純快照讀取模式》",
+            f"BUILD_TAG：{APP_BUILD_TAG}",
+            "資料來源：ranking_result + teacher_strategy_snapshot；未執行重建排行、未執行EPS MATRIX、未呼叫外部API。",
+            "",
+            "【TOP20 前5檔】",
+        ]
+        for i, (_, r) in enumerate(df.head(5).iterrows(), start=1):
+            sid = r.get("stock_id", r.get("代號", ""))
+            name = r.get("stock_name", r.get("名稱", ""))
+            score = float(pd.to_numeric(pd.Series([r.get("total_score", 0)]), errors="coerce").fillna(0).iloc[0])
+            teacher = r.get("teacher_final_decision", r.get("action", "-"))
+            reason = r.get("teacher_no_trade_reason", "")
+            lines.append(f"{i}. {sid} {name}｜score {score:.2f}｜teacher={teacher}｜{reason}")
+        self.detail.delete("1.0", tk.END)
+        self.detail.insert("1.0", "\n".join(lines))
+        self.set_status("AI TOP20 已用快照讀取完成，未觸發重算。")
+        return True
 
-                lines.extend(["", "【條件預掛】"])
-                if wait_pullback.empty:
-                    lines.append("無條件預掛")
-                else:
-                    for i, (_, r) in enumerate(wait_pullback.iterrows(), start=1):
-                        lines.append(f"{i}. {r['stock_id']} {r['stock_name']}｜條件預掛｜RR {r['rr']:.2f}｜勝率 {r['win_rate']:.1f}%｜{r['entry_zone']}")
-
-                self.ui_call(self.detail.delete, "1.0", tk.END)
-                self.ui_call(self.detail.insert, "1.0", "\n".join(lines))
-                self._save_ai_top20_snapshot(signature)
-                self.ui_call(self.finish_task, "AI選股TOP20", f"AI選股完成：TOP20 {len(trade_top20)}｜今日可下單 {len(today_buy)}｜等待 {len(wait_pullback)}")
-            except OperationCancelled:
-                self.ui_call(self.finish_task, "AI選股TOP20", "AI選股TOP20 已中斷")
-            except Exception as e:
-                traceback.print_exc()
-                self.ui_call(messagebox.showerror, "錯誤", str(e))
-
-        self._run_in_thread(worker, "show_top20")
+    def show_top20(self):
+        """AI選股TOP20：純讀取快照，不得觸發每日更新或重建排行。"""
+        if not self.ensure_ranking_ready(auto_rebuild=False):
+            return messagebox.showwarning("提醒", "目前尚無 AI TOP20 快照資料。請先執行『每日增量更新』，不要在 TOP20 顯示層自動重建。")
+        self.clear_log()
+        self.append_log(f"[WORKFLOW][AI_TOP20_VIEW] START｜BUILD_TAG={APP_BUILD_TAG}")
+        try:
+            if self.workflow_orchestrator is not None:
+                self.workflow_orchestrator.ai_top20_view(
+                    read_top20_snapshot_fn=self._read_top20_snapshot_for_view,
+                    render_ui_fn=self._render_top20_snapshot_view,
+                    top_n=20,
+                )
+            else:
+                top20_df = self._read_top20_snapshot_for_view(top_n=20)
+                self._render_top20_snapshot_view(top20_df)
+            self.append_log("[WORKFLOW][AI_TOP20_VIEW] END｜只讀 ranking_result / teacher_snapshot；未執行 ranking_rebuild / update_daily / EPS MATRIX")
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("錯誤", str(e))
 
 
     def show_strategy_backtest(self):
