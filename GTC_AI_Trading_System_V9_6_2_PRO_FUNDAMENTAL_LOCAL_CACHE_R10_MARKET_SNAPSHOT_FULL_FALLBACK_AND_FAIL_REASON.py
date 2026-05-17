@@ -37,6 +37,7 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -3710,48 +3711,159 @@ class DataEngine:
         df.attrs["source"] = "TWSE_OFFICIAL_STOCK_DAY"
         return df[["date", "open", "high", "low", "close", "volume", "turnover"]]
 
+    @staticmethod
+    def _extract_tpex_history_rows(payload=None, html_text: str = "", log_cb=None) -> list[dict]:
+        """R10-HISTORY-FIX：TPEx 個股歷史資料解析器。
+
+        支援：
+        1) 新版 TPEx JSON 欄位 data / tables / aaData。
+        2) 舊版 st43_result.php aaData。
+        3) 官方頁面回傳 HTML table 時，以 pandas.read_html 作 fallback。
+
+        回傳欄位固定為 price_history schema：date/open/high/low/close/volume/turnover。
+        """
+        parsed_rows: list[dict] = []
+
+        def _append_row(r):
+            if r is None:
+                return
+            if isinstance(r, dict):
+                date_v = r.get("日期") or r.get("Date") or r.get("date") or r.get("成交日期") or r.get("trade_date")
+                volume_v = (r.get("成交股數") or r.get("成交仟股") or r.get("成交數量") or
+                            r.get("Volume") or r.get("volume"))
+                turnover_v = (r.get("成交金額") or r.get("成交仟元") or r.get("成交值") or
+                              r.get("Turnover") or r.get("turnover"))
+                open_v = r.get("開盤價") or r.get("開盤") or r.get("Open") or r.get("open")
+                high_v = r.get("最高價") or r.get("最高") or r.get("High") or r.get("high")
+                low_v = r.get("最低價") or r.get("最低") or r.get("Low") or r.get("low")
+                close_v = r.get("收盤價") or r.get("收盤") or r.get("Close") or r.get("close")
+            elif isinstance(r, (list, tuple)) and len(r) >= 7:
+                # TPEx 常見順序：日期、成交股數/仟股、成交金額/仟元、開盤、最高、最低、收盤、漲跌、筆數
+                date_v, volume_v, turnover_v, open_v, high_v, low_v, close_v = r[:7]
+            else:
+                return
+
+            trade_date = DataEngine._parse_tw_date(date_v)
+            close_p = DataEngine._clean_number_value(close_v)
+            if not trade_date or pd.isna(close_p):
+                return
+            parsed_rows.append({
+                "date": trade_date,
+                "open": DataEngine._clean_number_value(open_v),
+                "high": DataEngine._clean_number_value(high_v),
+                "low": DataEngine._clean_number_value(low_v),
+                "close": close_p,
+                "volume": DataEngine._clean_number_value(volume_v),
+                "turnover": DataEngine._clean_number_value(turnover_v),
+            })
+
+        if isinstance(payload, dict):
+            data = payload.get("data") or payload.get("aaData") or payload.get("records") or []
+            if not data and isinstance(payload.get("tables"), list):
+                for t in payload.get("tables") or []:
+                    if isinstance(t, dict):
+                        data = t.get("data") or t.get("aaData") or t.get("rows") or []
+                        if data:
+                            break
+            for r in data or []:
+                _append_row(r)
+        elif isinstance(payload, list):
+            for r in payload:
+                _append_row(r)
+
+        if parsed_rows:
+            return parsed_rows
+
+        # HTML fallback：官方頁若回傳 table，不因 JSON 解析失敗而直接放棄。
+        html_text = str(html_text or "")
+        if "<table" in html_text.lower():
+            try:
+                tables = pd.read_html(io.StringIO(html_text))
+                for table in tables:
+                    if table is None or table.empty:
+                        continue
+                    t = table.copy()
+                    t.columns = [str(c).strip() for c in t.columns]
+                    # 有表頭時走 dict；無表頭時走 list。
+                    if any("日期" in str(c) for c in t.columns):
+                        for rec in t.to_dict("records"):
+                            _append_row(rec)
+                    else:
+                        for row in t.values.tolist():
+                            _append_row(row)
+                    if parsed_rows:
+                        break
+            except Exception as exc:
+                if log_cb:
+                    log_cb(f"[HISTORY][TPEX][HTML_PARSE_WARN] HTML table fallback 解析失敗：{exc}")
+        return parsed_rows
+
     def fetch_tpex_history_official(self, stock_id: str, months: int = 30, log_cb=None) -> pd.DataFrame:
-        """TPEx 官方 st43_result.php 逐月歷史資料。"""
+        """TPEx 官方個股日成交歷史資料。
+
+        R10-HISTORY-FIX：
+        - 保留官方優先，不動 build_full_history / price_history 結構。
+        - 新版 TPEx API 優先，舊版 st43_result.php 相容。
+        - 加入 Content-Type / status_code / final_url / response preview 記錄。
+        - JSON 失敗時不直接判死，改用 HTML table fallback parser。
+        """
         stock_id = normalize_stock_id(stock_id)
         if not stock_id:
             return pd.DataFrame()
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.tpex.org.tw/"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json, text/html, */*",
+            "Referer": "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/stock-pricing.html",
+        }
         rows = []
         for yyyymm01 in self._month_start_list(months):
             roc_month = self._to_tpex_roc_month(yyyymm01)
-            url = f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_month}&stkno={stock_id}"
-            try:
-                res = requests.get(url, headers=headers, timeout=20)
-                if res.status_code != 200:
+            roc_month_encoded = quote(roc_month, safe="")
+            request_candidates = [
+                # 新版官方頁面對應 API（個股日成交資訊）。
+                ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock", {"code": stock_id, "date": roc_month, "response": "json"}),
+                ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock", {"stockNo": stock_id, "date": roc_month, "response": "json"}),
+                # 舊版 st43_result.php，相容既有資料來源。
+                (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_month_encoded}&stkno={stock_id}", None),
+                (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_month}&stkno={stock_id}", None),
+            ]
+
+            month_rows = []
+            last_error = ""
+            for url, params in request_candidates:
+                try:
+                    res = requests.get(url, params=params, headers=headers, timeout=25)
+                    content_type = str(res.headers.get("Content-Type", ""))
+                    final_url = getattr(res, "url", url)
+                    if res.status_code != 200:
+                        last_error = f"HTTP {res.status_code} content_type={content_type} url={final_url}"
+                        continue
+                    text_body = res.text or ""
+                    payload = None
+                    json_error = ""
+                    if "json" in content_type.lower() or text_body.lstrip().startswith(("{", "[")):
+                        try:
+                            payload = res.json()
+                        except Exception as exc:
+                            json_error = str(exc)
+                    else:
+                        json_error = f"non_json_content_type={content_type}"
+
+                    month_rows = self._extract_tpex_history_rows(payload=payload, html_text=text_body, log_cb=log_cb)
+                    if month_rows:
+                        rows.extend(month_rows)
+                        if log_cb:
+                            log_cb(f"[HISTORY][TPEX][OK] {stock_id} {roc_month} rows={len(month_rows)} url={final_url}")
+                        break
+
+                    preview = re.sub(r"\s+", " ", text_body[:500]).strip()
+                    last_error = f"no_rows content_type={content_type} json_error={json_error} url={final_url} preview={preview}"
+                except Exception as exc:
+                    last_error = f"request_failed url={url} params={params} exc={exc}"
                     continue
-                payload = res.json()
-                data = None
-                if isinstance(payload, dict):
-                    data = payload.get("aaData") or payload.get("data") or []
-                if not data:
-                    continue
-                for r in data:
-                    if not isinstance(r, (list, tuple)) or len(r) < 7:
-                        continue
-                    trade_date = self._parse_tw_date(r[0])
-                    if not trade_date:
-                        continue
-                    volume = self._clean_number_value(r[1])
-                    turnover = self._clean_number_value(r[2])
-                    open_p = self._clean_number_value(r[3])
-                    high_p = self._clean_number_value(r[4])
-                    low_p = self._clean_number_value(r[5])
-                    close_p = self._clean_number_value(r[6])
-                    if pd.isna(close_p):
-                        continue
-                    rows.append({
-                        "date": trade_date, "open": open_p, "high": high_p, "low": low_p,
-                        "close": close_p, "volume": volume, "turnover": turnover,
-                    })
-            except Exception as exc:
-                if log_cb:
-                    log_cb(f"[HISTORY][TPEX][WARN] {stock_id} {roc_month} 官方歷史讀取失敗：{exc}")
-                continue
+
+            if not month_rows and log_cb:
+                log_cb(f"[HISTORY][TPEX][WARN] {stock_id} {roc_month} 官方歷史讀取失敗：{last_error}")
             time.sleep(0.03)
         if not rows:
             return pd.DataFrame()
@@ -3759,16 +3871,19 @@ class DataEngine:
         for c in ["open", "high", "low", "close", "volume", "turnover"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(subset=["close"])
-        df.attrs["source"] = "TPEX_OFFICIAL_ST43"
+        df.attrs["source"] = "TPEX_OFFICIAL_HISTORY_R10_FIXED"
         return df[["date", "open", "high", "low", "close", "volume", "turnover"]]
 
     def download_history_official_first(self, stock_id: str, market: str, months: int = 30, log_cb=None) -> pd.DataFrame:
         """完整歷史建庫統一入口：官方主、Yahoo輔。"""
         stock_id = normalize_stock_id(stock_id)
         market_text = str(market or "").strip()
-        official_candidates = []
+        # R10-HISTORY-FIX：市場判斷只決定官方查詢順序，不直接排除另一個市場。
+        # 上櫃先 TPEx；上市先 TWSE；ETF/00開頭先 TWSE 再 TPEx，避免上櫃 ETF 或特殊代號漏抓。
         if market_text == "上櫃":
             official_candidates = [self.fetch_tpex_history_official, self.fetch_twse_history_official]
+        elif market_text == "ETF" or stock_id.startswith("00"):
+            official_candidates = [self.fetch_twse_history_official, self.fetch_tpex_history_official]
         else:
             official_candidates = [self.fetch_twse_history_official, self.fetch_tpex_history_official]
 
