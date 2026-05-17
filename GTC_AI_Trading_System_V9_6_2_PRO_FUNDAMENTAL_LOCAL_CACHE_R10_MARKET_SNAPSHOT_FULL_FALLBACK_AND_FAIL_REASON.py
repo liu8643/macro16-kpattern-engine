@@ -25,6 +25,7 @@ import requests
 import sys
 import csv
 import io
+import contextlib
 import re
 import threading
 import time
@@ -3564,6 +3565,50 @@ class DataEngine:
             return f"{stock_id}.TWO"
         return stock_id
 
+    # [HISTORY_HOTFIX_20260517]
+    # 完整歷史建庫不得把非普通交易標的、已轉換/下市/槓桿反向/債券型商品無腦丟給 Yahoo。
+    # 依 log 真因：00400/00401/00403/00620/00625/00631 連續 .TW/.TWO No data，導致建庫前段卡住。
+    HISTORY_SKIP_EXACT_CODES = {"00400", "00401", "00403", "00620", "00625", "00631"}
+    HISTORY_SKIP_PREFIXES = ("004",)
+    HISTORY_SKIP_NAME_PATTERN = re.compile(
+        r"權證|認購|認售|牛證|熊證|展延|債|公司債|金融債|美債|投等債|高收益債|期貨|正2|反1|槓桿|反向",
+        re.I,
+    )
+
+    def should_skip_history_download(self, stock_id: str, market: str = "", stock_name: str = "") -> tuple[bool, str]:
+        """完整歷史建庫前置 Gate。
+
+        只停掉已知會造成 Yahoo 長時間無效重試的標的，不改正常上市/上櫃股票與一般 ETF。
+        回傳：(是否跳過, 原因)。
+        """
+        code = str(stock_id or "").strip()
+        name = str(stock_name or "").strip()
+        if not re.fullmatch(r"\d{4,5}", code):
+            return True, "invalid_code_format"
+        if code in self.HISTORY_SKIP_EXACT_CODES:
+            return True, "known_no_yahoo_history_from_log"
+        if code.startswith(self.HISTORY_SKIP_PREFIXES):
+            return True, "non_common_security_prefix_004"
+        if name and self.HISTORY_SKIP_NAME_PATTERN.search(name):
+            return True, "non_common_or_bond_leveraged_inverse_product"
+        return False, ""
+
+    def history_yahoo_symbols(self, stock_id: str, market: str) -> list[str]:
+        """歷史資料 Yahoo symbol 清單。
+
+        舊版會對每檔都嘗試 primary + .TW + .TWO。
+        對錯誤代號會造成雙倍無效請求；這裡依市場只試必要 symbol。
+        """
+        code = str(stock_id or "").strip()
+        market = str(market or "").strip()
+        if not code:
+            return []
+        if market in ("上市", "ETF") or code.startswith("00"):
+            return [f"{code}.TW"]
+        if market == "上櫃":
+            return [f"{code}.TWO"]
+        return [f"{code}.TW", f"{code}.TWO"]
+
     @staticmethod
     def _to_num(series: pd.Series) -> pd.Series:
         return pd.to_numeric(series.astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
@@ -3622,21 +3667,24 @@ class DataEngine:
     def download_history(self, stock_id: str, market: str, period: str = "2y") -> pd.DataFrame:
         if yf is None:
             return pd.DataFrame()
-        symbols = []
-        primary = self.yahoo_symbol(stock_id, market)
-        if primary:
-            symbols.append(primary)
-        if f"{stock_id}.TW" not in symbols:
-            symbols.append(f"{stock_id}.TW")
-        if f"{stock_id}.TWO" not in symbols:
-            symbols.append(f"{stock_id}.TWO")
+        skip, _reason = self.should_skip_history_download(stock_id, market)
+        if skip:
+            return pd.DataFrame()
+        symbols = self.history_yahoo_symbols(stock_id, market)
         seen = set()
         for symbol in symbols:
             if symbol in seen:
                 continue
             seen.add(symbol)
             try:
-                hist = yf.Ticker(symbol).history(period=period, auto_adjust=False)
+                # [HISTORY_HOTFIX_20260517]
+                # yfinance 對無效代號會直接寫 stdout/stderr：possibly delisted / HTTP 404。
+                # 建庫時這些訊息會灌爆 console 並讓使用者誤判卡死；此處只保留本系統 log。
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        hist = yf.Ticker(symbol).history(period=period, auto_adjust=False, timeout=8)
+                    except TypeError:
+                        hist = yf.Ticker(symbol).history(period=period, auto_adjust=False)
                 if hist is None or hist.empty:
                     continue
                 hist = hist.rename(columns={
@@ -3658,14 +3706,10 @@ class DataEngine:
     def download_latest_bar_yahoo(self, stock_id: str, market: str, days: str = "7d") -> pd.DataFrame:
         if yf is None:
             return pd.DataFrame()
-        symbols = []
-        primary = self.yahoo_symbol(stock_id, market)
-        if primary:
-            symbols.append(primary)
-        if f"{stock_id}.TW" not in symbols:
-            symbols.append(f"{stock_id}.TW")
-        if f"{stock_id}.TWO" not in symbols:
-            symbols.append(f"{stock_id}.TWO")
+        skip, _reason = self.should_skip_history_download(stock_id, market)
+        if skip:
+            return pd.DataFrame()
+        symbols = self.history_yahoo_symbols(stock_id, market)
 
         seen = set()
         latest = pd.DataFrame()
@@ -3674,7 +3718,11 @@ class DataEngine:
                 continue
             seen.add(symbol)
             try:
-                hist = yf.Ticker(symbol).history(period=days, auto_adjust=False)
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    try:
+                        hist = yf.Ticker(symbol).history(period=days, auto_adjust=False, timeout=8)
+                    except TypeError:
+                        hist = yf.Ticker(symbol).history(period=days, auto_adjust=False)
                 if hist is None or hist.empty:
                     continue
                 hist = hist.rename(columns={
@@ -3708,6 +3756,14 @@ class DataEngine:
                 raise OperationCancelled("使用者中斷完整歷史建庫")
             stock_id = str(row["stock_id"])
             market = str(row["market"])
+            stock_name = str(row.get("stock_name", ""))
+            skip_history, skip_reason = self.should_skip_history_download(stock_id, market, stock_name)
+            if skip_history:
+                if progress_cb:
+                    progress_cb(idx, total, stock_id, 0, "skip_invalid")
+                if log_cb:
+                    log_cb(f"[{idx}/{total}] {stock_id} 跳過歷史建庫｜{skip_reason}")
+                continue
             existing = self.db.get_price_history_count(stock_id)
             if existing >= min_days:
                 if progress_cb:
