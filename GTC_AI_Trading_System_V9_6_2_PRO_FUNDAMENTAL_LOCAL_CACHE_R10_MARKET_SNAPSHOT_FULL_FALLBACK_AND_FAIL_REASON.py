@@ -609,6 +609,12 @@ os.environ.setdefault("GTC_DEBUG_EPS_CACHE", "0")
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
 TWSE_OPENAPI_LICENSE_URL = "http://data.gov.tw/license"
 TWSE_OPENAPI_SWAGGER_URL = "https://openapi.twse.com.tw/v1/swagger.json"
+# R11 DAILY_OPEN_DATA_HISTORY_SPLIT：政府資料開放平台 dataset 11549 指定之每日全市場資料來源。
+# 授權說明網址：http://data.gov.tw/license
+# OAS標準之API說明文件網址：https://openapi.twse.com.tw/v1/swagger.json
+TWSE_STOCK_DAY_ALL_OPEN_DATA_ENDPOINT = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data"
+TWSE_STOCK_DAY_ALL_OPENAPI_ENDPOINT = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+TWSE_STOCK_DAY_SINGLE_HISTORY_ENDPOINT = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
 EXTERNAL_DATA_SOURCE_PRIORITY = [
     "TWSE OpenAPI / TWSE 官方 API",
     "TPEx 官方頁面 / CSV",
@@ -2213,9 +2219,162 @@ def parse_twse_mi_index_csv(csv_text: str) -> pd.DataFrame:
     return df[["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]].drop_duplicates(subset=["stock_id"])
 
 
-def download_twse_official_daily_csv(date_str: str | None = None, fallback_days: int = 10) -> pd.DataFrame:
+def _parse_official_daily_date(value) -> str:
+    """R11：解析 TWSE STOCK_DAY_ALL 的日期欄位，支援民國年與西元年。"""
+    s = str(value or "").strip().replace(".", "/").replace("-", "/")
+    m = re.match(r"^(\d{2,3})/(\d{1,2})/(\d{1,2})$", s)
+    if m:
+        return f"{int(m.group(1)) + 1911:04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", s)
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m = re.match(r"^(\d{8})$", s)
+    if m:
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+    try:
+        return pd.to_datetime(s).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+
+def parse_twse_stock_day_all_records(data, source_name: str = "TWSE_STOCK_DAY_ALL") -> pd.DataFrame:
+    """R11：解析 TWSE 官方 STOCK_DAY_ALL 全市場每日盤後資料。
+
+    資料來源：
+    - https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data
+    - https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL
+
+    正確用途：每日增量更新。不可用此函式建立完整歷史，完整歷史只能走 STOCK_DAY 單股補歷史。
+    """
+    if data is None:
+        return pd.DataFrame()
+    try:
+        if isinstance(data, pd.DataFrame):
+            df = data.copy()
+        elif isinstance(data, list):
+            df = pd.DataFrame(data)
+        elif isinstance(data, dict):
+            df = pd.DataFrame(data.get("data") or data.get("records") or data.get("result") or [])
+        else:
+            return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.rename(columns={
+        "日期": "date", "Date": "date", "date": "date",
+        "證券代號": "stock_id", "Code": "stock_id", "SecuritiesCompanyCode": "stock_id", "公司代號": "stock_id",
+        "證券名稱": "stock_name", "Name": "stock_name", "公司名稱": "stock_name",
+        "成交股數": "volume", "TradingShares": "volume", "Volume": "volume",
+        "成交金額": "turnover", "TransactionAmount": "turnover", "Turnover": "turnover",
+        "開盤價": "open", "Open": "open",
+        "最高價": "high", "High": "high",
+        "最低價": "low", "Low": "low",
+        "收盤價": "close", "Close": "close",
+        "成交筆數": "trades", "Transaction": "trades",
+    })
+    required = ["stock_id", "open", "high", "low", "close", "volume"]
+    if not all(c in df.columns for c in required):
+        return pd.DataFrame()
+
+    df["stock_id"] = df["stock_id"].astype(str).str.strip().map(normalize_stock_id)
+    df = df[df["stock_id"].astype(str).str.fullmatch(r"\d{4,5}", na=False)].copy()
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", "", regex=False).str.replace("--", "", regex=False).str.strip(), errors="coerce")
+    if "turnover" in df.columns:
+        df["turnover"] = pd.to_numeric(df["turnover"].astype(str).str.replace(",", "", regex=False).str.replace("--", "", regex=False).str.strip(), errors="coerce")
+    else:
+        df["turnover"] = df["close"] * df["volume"].fillna(0)
+    if "date" in df.columns:
+        df["date"] = df["date"].map(_parse_official_daily_date)
+    else:
+        df["date"] = datetime.now().strftime("%Y-%m-%d")
+    df = df.dropna(subset=["close"])
+    if df.empty:
+        return df
+    df["source"] = source_name
+    return df[["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]].drop_duplicates(subset=["stock_id"], keep="last")
+
+
+def parse_twse_stock_day_all_open_data(csv_text: str) -> pd.DataFrame:
+    """R11：解析 STOCK_DAY_ALL?response=open_data CSV。"""
+    if not str(csv_text or "").strip():
+        return pd.DataFrame()
+    last_error = None
+    for enc in (None,):
+        try:
+            df = pd.read_csv(io.StringIO(csv_text), dtype=str).fillna("")
+            out = parse_twse_stock_day_all_records(df, source_name="TWSE_STOCK_DAY_ALL_OPEN_DATA")
+            if out is not None and not out.empty:
+                return out
+        except Exception as exc:
+            last_error = exc
+            continue
+    try:
+        # 某些環境回傳前面可能帶說明文字，退回 csv.reader 逐行解析。
+        rows = []
+        reader = csv.DictReader(io.StringIO(csv_text))
+        for row in reader:
+            rows.append(row)
+        return parse_twse_stock_day_all_records(rows, source_name="TWSE_STOCK_DAY_ALL_OPEN_DATA")
+    except Exception:
+        if last_error:
+            log_warning(f"[R11][STOCK_DAY_ALL][PARSE_WARN] {last_error}")
+        return pd.DataFrame()
+
+
+def download_twse_official_daily_csv(date_str: str | None = None, fallback_days: int = 10, log_cb=None) -> pd.DataFrame:
+    """R11：每日增量更新優先使用 TWSE STOCK_DAY_ALL 全市場 OpenData。
+
+    正確分工：
+    1) 每日增量更新：STOCK_DAY_ALL?response=open_data，一次取得上市全市場每日盤後資料。
+    2) 單股補歷史：STOCK_DAY?response=json&date=YYYYMM01&stockNo=xxxx。
+    3) MI_INDEX 僅保留最後備援，不再當每日更新主來源。
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.twse.com.tw/",
+        "Accept": "text/csv, application/json, text/plain, */*",
+    }
+
+    # 第一層：政府資料開放平台 dataset 11549 對應之 OpenData CSV，一次抓全市場。
+    try:
+        resp = requests.get(TWSE_STOCK_DAY_ALL_OPEN_DATA_ENDPOINT, headers=headers, timeout=30)
+        resp.raise_for_status()
+        if not resp.encoding or str(resp.encoding).lower() in ("iso-8859-1", "ascii"):
+            resp.encoding = "utf-8"
+        df = parse_twse_stock_day_all_open_data(resp.text)
+        if df is not None and not df.empty:
+            df.attrs["source"] = "TWSE_STOCK_DAY_ALL_OPEN_DATA"
+            if log_cb:
+                log_cb(f"[DAILY][TWSE][OPEN_DATA][OK] rows={len(df)} source={TWSE_STOCK_DAY_ALL_OPEN_DATA_ENDPOINT}")
+            return df
+        if log_cb:
+            log_cb(f"[DAILY][TWSE][OPEN_DATA][WARN] no rows content_type={resp.headers.get('Content-Type','')}")
+    except Exception as exc:
+        if log_cb:
+            log_cb(f"[DAILY][TWSE][OPEN_DATA][WARN] {exc}")
+
+    # 第二層：TWSE OpenAPI JSON。
+    try:
+        resp = requests.get(TWSE_STOCK_DAY_ALL_OPENAPI_ENDPOINT, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        df = parse_twse_stock_day_all_records(data, source_name="TWSE_STOCK_DAY_ALL_OPENAPI")
+        if df is not None and not df.empty:
+            df.attrs["source"] = "TWSE_STOCK_DAY_ALL_OPENAPI"
+            if log_cb:
+                log_cb(f"[DAILY][TWSE][OPENAPI][OK] rows={len(df)} source={TWSE_STOCK_DAY_ALL_OPENAPI_ENDPOINT}")
+            return df
+        if log_cb:
+            log_cb("[DAILY][TWSE][OPENAPI][WARN] no rows")
+    except Exception as exc:
+        if log_cb:
+            log_cb(f"[DAILY][TWSE][OPENAPI][WARN] {exc}")
+
+    # 第三層：舊 MI_INDEX CSV 只作最後備援。
     base_date = datetime.strptime(date_str, "%Y%m%d") if date_str else datetime.now()
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
     for offset in range(fallback_days + 1):
         use_date = (base_date - pd.Timedelta(days=offset)).strftime("%Y%m%d")
         url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&date={use_date}&type=ALLBUT0999"
@@ -2224,8 +2383,13 @@ def download_twse_official_daily_csv(date_str: str | None = None, fallback_days:
             resp.raise_for_status()
             df = parse_twse_mi_index_csv(resp.text)
             if df is not None and not df.empty:
+                df.attrs["source"] = "TWSE_MI_INDEX_LEGACY_FALLBACK"
+                if log_cb:
+                    log_cb(f"[DAILY][TWSE][MI_INDEX_FALLBACK][OK] rows={len(df)} date={use_date}")
                 return df
-        except Exception:
+        except Exception as exc:
+            if log_cb and offset == 0:
+                log_cb(f"[DAILY][TWSE][MI_INDEX_FALLBACK][WARN] {exc}")
             continue
     return pd.DataFrame()
 
@@ -3569,13 +3733,15 @@ class DataEngine:
     def _to_num(series: pd.Series) -> pd.Series:
         return pd.to_numeric(series.astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
 
-    def fetch_twse_daily(self) -> pd.DataFrame:
+    def fetch_twse_daily(self, log_cb=None) -> pd.DataFrame:
+        """R11：上市每日資料只走全市場官方快取，不逐檔抓歷史 API。"""
         try:
-            df = download_twse_official_daily_csv()
+            df = download_twse_official_daily_csv(log_cb=log_cb)
             if df is not None and not df.empty:
                 return df
-        except Exception:
-            pass
+        except Exception as exc:
+            if log_cb:
+                log_cb(f"[DAILY][TWSE][WARN] 全市場官方每日資料失敗：{exc}")
         return pd.DataFrame()
 
     def fetch_tpex_daily(self) -> pd.DataFrame:
@@ -3959,7 +4125,12 @@ class DataEngine:
         return df[["date", "open", "high", "low", "close", "volume", "turnover"]]
 
     def download_history_official_first(self, stock_id: str, market: str, months: int = 30, log_cb=None) -> pd.DataFrame:
-        """完整歷史建庫統一入口：官方主、Yahoo輔。"""
+        """完整歷史建庫統一入口：官方主、Yahoo輔。
+
+        R11 分工限制：
+        - 本函式只允許 build_full_history / 單股補洞使用。
+        - 每日增量更新不得呼叫本函式，避免 2267 檔 × 月份 的重型 request 鏈。
+        """
         stock_id = normalize_stock_id(stock_id)
         market_text = str(market or "").strip()
         # R10-HISTORY-FIX：市場判斷只決定官方查詢順序，不直接排除另一個市場。
@@ -4085,6 +4256,9 @@ class DataEngine:
         failed = 0
         rows = 0
         total = len(master)
+        if log_cb:
+            log_cb("[HISTORY][POLICY] 完整歷史建庫=只補 price_history 不足 min_days 的個股；來源順序：TWSE/TPEx 單股月歷史 → Yahoo備援。")
+            log_cb("[HISTORY][POLICY] 每日增量更新不得使用本流程；每日更新請使用 STOCK_DAY_ALL / TPEx OpenAPI 全市場資料。")
         for idx, (_, row) in enumerate(master.iterrows(), start=1):
             if cancel_cb and cancel_cb():
                 raise OperationCancelled("使用者中斷完整歷史建庫")
@@ -4131,8 +4305,13 @@ class DataEngine:
         if master.empty:
             return 0, 0, 0
 
-        twse_df = self.fetch_twse_daily()
+        # R11：每日增量更新主流程只讀全市場官方日資料，不使用單股歷史 API 當每日更新來源。
+        twse_df = self.fetch_twse_daily(log_cb=log_cb)
         tpex_df = self.fetch_tpex_daily()
+
+        if log_cb:
+            log_cb(f"[DAILY][OFFICIAL_MAP] TWSE_STOCK_DAY_ALL rows={0 if twse_df is None or twse_df.empty else len(twse_df)}｜TPEx_OpenAPI rows={0 if tpex_df is None or tpex_df.empty else len(tpex_df)}")
+            log_cb("[DAILY][POLICY] 每日增量=STOCK_DAY_ALL/OpenAPI 全市場資料；單股 STOCK_DAY 只用於完整歷史補洞。")
 
         official_map = {}
         if not twse_df.empty:
