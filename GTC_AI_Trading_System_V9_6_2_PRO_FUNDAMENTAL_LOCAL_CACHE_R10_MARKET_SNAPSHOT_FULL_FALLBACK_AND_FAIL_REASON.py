@@ -3662,6 +3662,21 @@ class DataEngine:
             dt = pd.Timestamp(datetime.now().date()).replace(day=1)
         return f"{int(dt.year) - 1911}/{int(dt.month):02d}"
 
+    @staticmethod
+    def _to_tpex_query_month(yyyymm01: str) -> str:
+        """R10-HISTORY-FIX2：TPEx 新版 /www/zh-tw/afterTrading/tradingStock 使用西元 YYYY/MM/01。
+
+        注意：這裡不是民國年月。
+        正確範例：
+            https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock?code=3455&date=2023%2F10%2F01&id=&response=html
+
+        前版錯把 date 帶成 113/05，會被導到 /errors 404 HTML。
+        """
+        dt = pd.to_datetime(str(yyyymm01), format="%Y%m%d", errors="coerce")
+        if pd.isna(dt):
+            dt = pd.Timestamp(datetime.now().date()).replace(day=1)
+        return f"{int(dt.year):04d}/{int(dt.month):02d}/01"
+
     def fetch_twse_history_official(self, stock_id: str, months: int = 30, log_cb=None) -> pd.DataFrame:
         """TWSE 官方 STOCK_DAY 逐月歷史資料。"""
         stock_id = normalize_stock_id(stock_id)
@@ -3712,49 +3727,76 @@ class DataEngine:
         return df[["date", "open", "high", "low", "close", "volume", "turnover"]]
 
     @staticmethod
-    def _extract_tpex_history_rows(payload=None, html_text: str = "", log_cb=None) -> list[dict]:
-        """R10-HISTORY-FIX：TPEx 個股歷史資料解析器。
+    def _extract_tpex_history_rows(payload=None, html_text: str = "", csv_text: str = "", log_cb=None) -> list[dict]:
+        """R10-HISTORY-FIX2：TPEx 個股歷史資料解析器。
 
         支援：
-        1) 新版 TPEx JSON 欄位 data / tables / aaData。
-        2) 舊版 st43_result.php aaData。
-        3) 官方頁面回傳 HTML table 時，以 pandas.read_html 作 fallback。
+        1) 新版 TPEx JSON：tables[0].data / data / aaData / records。
+        2) 新版 TPEx HTML table：/www/zh-tw/afterTrading/tradingStock?code=xxxx&date=YYYY/MM/01&id=&response=html。
+        3) CSV fallback：response=csv / response=csv-download 類型。
+        4) 舊版 st43_result.php aaData / tables data。
 
-        回傳欄位固定為 price_history schema：date/open/high/low/close/volume/turnover。
+        TPEx 歷史欄位多為「成交仟股 / 成交仟元」，寫入 price_history 前需乘 1000。
+        回傳欄位固定：date/open/high/low/close/volume/turnover。
         """
         parsed_rows: list[dict] = []
+
+        def _pick_dict_value(d: dict, keys: list[str]):
+            for k in keys:
+                if k in d and str(d.get(k, "")).strip() != "":
+                    return d.get(k)
+            # pandas read_html 可能產生多層欄位或帶空白，做一次模糊比對。
+            for dk, dv in d.items():
+                dks = str(dk).replace(" ", "").strip()
+                for k in keys:
+                    if str(k).replace(" ", "").strip() == dks and str(dv).strip() != "":
+                        return dv
+            return ""
 
         def _append_row(r):
             if r is None:
                 return
+            volume_is_thousand = False
+            turnover_is_thousand = False
             if isinstance(r, dict):
-                date_v = r.get("日期") or r.get("Date") or r.get("date") or r.get("成交日期") or r.get("trade_date")
-                volume_v = (r.get("成交股數") or r.get("成交仟股") or r.get("成交數量") or
-                            r.get("Volume") or r.get("volume"))
-                turnover_v = (r.get("成交金額") or r.get("成交仟元") or r.get("成交值") or
-                              r.get("Turnover") or r.get("turnover"))
-                open_v = r.get("開盤價") or r.get("開盤") or r.get("Open") or r.get("open")
-                high_v = r.get("最高價") or r.get("最高") or r.get("High") or r.get("high")
-                low_v = r.get("最低價") or r.get("最低") or r.get("Low") or r.get("low")
-                close_v = r.get("收盤價") or r.get("收盤") or r.get("Close") or r.get("close")
+                date_v = _pick_dict_value(r, ["日期", "日 期", "Date", "date", "成交日期", "trade_date"])
+                volume_v = _pick_dict_value(r, ["成交仟股", "成交股數", "成交數量", "成交量", "Volume", "volume"])
+                turnover_v = _pick_dict_value(r, ["成交仟元", "成交金額", "成交值", "Turnover", "turnover"])
+                open_v = _pick_dict_value(r, ["開盤", "開盤價", "Open", "open"])
+                high_v = _pick_dict_value(r, ["最高", "最高價", "High", "high"])
+                low_v = _pick_dict_value(r, ["最低", "最低價", "Low", "low"])
+                close_v = _pick_dict_value(r, ["收盤", "收盤價", "Close", "close"])
+                joined_keys = " ".join(str(k) for k in r.keys())
+                volume_is_thousand = "成交仟股" in joined_keys
+                turnover_is_thousand = "成交仟元" in joined_keys
             elif isinstance(r, (list, tuple)) and len(r) >= 7:
-                # TPEx 常見順序：日期、成交股數/仟股、成交金額/仟元、開盤、最高、最低、收盤、漲跌、筆數
+                # TPEx 常見順序：日期、成交仟股、成交仟元、開盤、最高、最低、收盤、漲跌、筆數
                 date_v, volume_v, turnover_v, open_v, high_v, low_v, close_v = r[:7]
+                volume_is_thousand = True
+                turnover_is_thousand = True
             else:
                 return
 
-            trade_date = DataEngine._parse_tw_date(date_v)
+            trade_date = DataEngine._parse_tw_date(str(date_v).replace("*", ""))
             close_p = DataEngine._clean_number_value(close_v)
             if not trade_date or pd.isna(close_p):
                 return
+
+            volume = DataEngine._clean_number_value(volume_v)
+            turnover = DataEngine._clean_number_value(turnover_v)
+            if not pd.isna(volume) and volume_is_thousand:
+                volume = float(volume) * 1000.0
+            if not pd.isna(turnover) and turnover_is_thousand:
+                turnover = float(turnover) * 1000.0
+
             parsed_rows.append({
                 "date": trade_date,
                 "open": DataEngine._clean_number_value(open_v),
                 "high": DataEngine._clean_number_value(high_v),
                 "low": DataEngine._clean_number_value(low_v),
                 "close": close_p,
-                "volume": DataEngine._clean_number_value(volume_v),
-                "turnover": DataEngine._clean_number_value(turnover_v),
+                "volume": volume,
+                "turnover": turnover,
             })
 
         if isinstance(payload, dict):
@@ -3774,7 +3816,6 @@ class DataEngine:
         if parsed_rows:
             return parsed_rows
 
-        # HTML fallback：官方頁若回傳 table，不因 JSON 解析失敗而直接放棄。
         html_text = str(html_text or "")
         if "<table" in html_text.lower():
             try:
@@ -3783,9 +3824,12 @@ class DataEngine:
                     if table is None or table.empty:
                         continue
                     t = table.copy()
-                    t.columns = [str(c).strip() for c in t.columns]
-                    # 有表頭時走 dict；無表頭時走 list。
-                    if any("日期" in str(c) for c in t.columns):
+                    # 處理 multi-index header。
+                    if isinstance(t.columns, pd.MultiIndex):
+                        t.columns = [" ".join([str(x) for x in col if str(x) != "nan"]).strip() for col in t.columns]
+                    else:
+                        t.columns = [str(c).strip() for c in t.columns]
+                    if any("日期" in str(c) or "日 期" in str(c) for c in t.columns):
                         for rec in t.to_dict("records"):
                             _append_row(rec)
                     else:
@@ -3796,49 +3840,83 @@ class DataEngine:
             except Exception as exc:
                 if log_cb:
                     log_cb(f"[HISTORY][TPEX][HTML_PARSE_WARN] HTML table fallback 解析失敗：{exc}")
+        if parsed_rows:
+            return parsed_rows
+
+        csv_text = str(csv_text or "")
+        if csv_text.strip():
+            try:
+                csv_df = pd.read_csv(io.StringIO(csv_text), dtype=str).fillna("")
+                if not csv_df.empty:
+                    for rec in csv_df.to_dict("records"):
+                        _append_row(rec)
+            except Exception:
+                try:
+                    csv_df = pd.read_csv(io.StringIO(csv_text), dtype=str, encoding="utf-8").fillna("")
+                    if not csv_df.empty:
+                        for rec in csv_df.to_dict("records"):
+                            _append_row(rec)
+                except Exception as exc:
+                    if log_cb:
+                        log_cb(f"[HISTORY][TPEX][CSV_PARSE_WARN] CSV fallback 解析失敗：{exc}")
         return parsed_rows
 
     def fetch_tpex_history_official(self, stock_id: str, months: int = 30, log_cb=None) -> pd.DataFrame:
         """TPEx 官方個股日成交歷史資料。
 
-        R10-HISTORY-FIX：
-        - 保留官方優先，不動 build_full_history / price_history 結構。
-        - 新版 TPEx API 優先，舊版 st43_result.php 相容。
-        - 加入 Content-Type / status_code / final_url / response preview 記錄。
-        - JSON 失敗時不直接判死，改用 HTML table fallback parser。
+        R10-HISTORY-FIX2：
+        - 只修 TPEx 歷史來源，不動 build_full_history / price_history / TWSE 架構。
+        - 修正新版 TPEx URL 日期參數：必須使用西元 YYYY/MM/01，不是民國 113/05。
+        - 官方主路徑：
+          https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock?code=00638&date=2024%2F05%2F01&id=&response=json
+        - JSON 若無資料，改試 HTML / CSV；舊版 st43_result.php 僅保留為最後相容。
+        - 加入 Content-Type / status_code / final_url / response preview，避免再次誤判為「官方沒資料」。
         """
         stock_id = normalize_stock_id(stock_id)
         if not stock_id:
             return pd.DataFrame()
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json, text/html, */*",
+            "Accept": "application/json, text/html, text/csv, */*",
             "Referer": "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/stock-pricing.html",
         }
         rows = []
         for yyyymm01 in self._month_start_list(months):
-            roc_month = self._to_tpex_roc_month(yyyymm01)
-            roc_month_encoded = quote(roc_month, safe="")
+            query_month = self._to_tpex_query_month(yyyymm01)   # 正確：西元 YYYY/MM/01
+            roc_month = self._to_tpex_roc_month(yyyymm01)       # 僅供舊版 endpoint 與 log
             request_candidates = [
-                # 新版官方頁面對應 API（個股日成交資訊）。
-                ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock", {"code": stock_id, "date": roc_month, "response": "json"}),
-                ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock", {"stockNo": stock_id, "date": roc_month, "response": "json"}),
-                # 舊版 st43_result.php，相容既有資料來源。
-                (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_month_encoded}&stkno={stock_id}", None),
-                (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_month}&stkno={stock_id}", None),
+                # 新版官方資料端點：json 優先。
+                ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock",
+                 {"code": stock_id, "date": query_month, "id": "", "response": "json"}, "json-main"),
+                # 新版官方資料端點：HTML fallback，網頁可直接看到表格。
+                ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock",
+                 {"code": stock_id, "date": query_month, "id": "", "response": "html"}, "html-main"),
+                # 新版官方資料端點：CSV fallback。
+                ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock",
+                 {"code": stock_id, "date": query_month, "id": "", "response": "csv"}, "csv-main"),
+                # 舊版相容：舊版使用民國年月。
+                (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={quote(roc_month, safe='')}&stkno={stock_id}",
+                 None, "legacy-st43-encoded"),
+                (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_month}&stkno={stock_id}",
+                 None, "legacy-st43-raw"),
             ]
 
             month_rows = []
             last_error = ""
-            for url, params in request_candidates:
+            for url, params, tag in request_candidates:
                 try:
                     res = requests.get(url, params=params, headers=headers, timeout=25)
                     content_type = str(res.headers.get("Content-Type", ""))
                     final_url = getattr(res, "url", url)
-                    if res.status_code != 200:
-                        last_error = f"HTTP {res.status_code} content_type={content_type} url={final_url}"
-                        continue
+                    # requests 通常可自動判斷；若 TPEx 回中文 HTML/CSV，強制 utf-8 讓 preview 與 read_html 較穩。
+                    if not res.encoding or str(res.encoding).lower() in ("iso-8859-1", "ascii"):
+                        res.encoding = "utf-8"
                     text_body = res.text or ""
+                    if res.status_code != 200:
+                        preview = re.sub(r"\s+", " ", text_body[:300]).strip()
+                        last_error = f"{tag} HTTP {res.status_code} content_type={content_type} url={final_url} preview={preview}"
+                        continue
+
                     payload = None
                     json_error = ""
                     if "json" in content_type.lower() or text_body.lstrip().startswith(("{", "[")):
@@ -3849,21 +3927,27 @@ class DataEngine:
                     else:
                         json_error = f"non_json_content_type={content_type}"
 
-                    month_rows = self._extract_tpex_history_rows(payload=payload, html_text=text_body, log_cb=log_cb)
+                    csv_text = text_body if ("csv" in content_type.lower() or tag.startswith("csv")) else ""
+                    month_rows = self._extract_tpex_history_rows(
+                        payload=payload,
+                        html_text=text_body,
+                        csv_text=csv_text,
+                        log_cb=log_cb,
+                    )
                     if month_rows:
                         rows.extend(month_rows)
                         if log_cb:
-                            log_cb(f"[HISTORY][TPEX][OK] {stock_id} {roc_month} rows={len(month_rows)} url={final_url}")
+                            log_cb(f"[HISTORY][TPEX][OK] {stock_id} {query_month} rows={len(month_rows)} source={tag} url={final_url}")
                         break
 
-                    preview = re.sub(r"\s+", " ", text_body[:500]).strip()
-                    last_error = f"no_rows content_type={content_type} json_error={json_error} url={final_url} preview={preview}"
+                    preview = re.sub(r"\s+", " ", text_body[:300]).strip()
+                    last_error = f"{tag} no_rows content_type={content_type} json_error={json_error} url={final_url} preview={preview}"
                 except Exception as exc:
-                    last_error = f"request_failed url={url} params={params} exc={exc}"
+                    last_error = f"{tag} request_failed url={url} params={params} exc={exc}"
                     continue
 
             if not month_rows and log_cb:
-                log_cb(f"[HISTORY][TPEX][WARN] {stock_id} {roc_month} 官方歷史讀取失敗：{last_error}")
+                log_cb(f"[HISTORY][TPEX][WARN] {stock_id} {query_month} 官方歷史讀取失敗：{last_error}")
             time.sleep(0.03)
         if not rows:
             return pd.DataFrame()
@@ -3871,7 +3955,7 @@ class DataEngine:
         for c in ["open", "high", "low", "close", "volume", "turnover"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(subset=["close"])
-        df.attrs["source"] = "TPEX_OFFICIAL_HISTORY_R10_FIXED"
+        df.attrs["source"] = "TPEX_OFFICIAL_HISTORY_R10_FIX2"
         return df[["date", "open", "high", "low", "close", "volume", "turnover"]]
 
     def download_history_official_first(self, stock_id: str, market: str, months: int = 30, log_cb=None) -> pd.DataFrame:
