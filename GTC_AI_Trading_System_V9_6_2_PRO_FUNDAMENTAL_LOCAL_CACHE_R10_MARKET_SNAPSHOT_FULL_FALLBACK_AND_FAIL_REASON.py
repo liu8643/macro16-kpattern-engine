@@ -37,7 +37,6 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
-from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -609,12 +608,6 @@ os.environ.setdefault("GTC_DEBUG_EPS_CACHE", "0")
 # 優先順序：1) TWSE OpenAPI / TWSE 官方 API；2) TPEx 官方頁面 / CSV；3) MOPS OpenData；4) Goodinfo 僅允許 fallback，不作為主資料源。
 TWSE_OPENAPI_LICENSE_URL = "http://data.gov.tw/license"
 TWSE_OPENAPI_SWAGGER_URL = "https://openapi.twse.com.tw/v1/swagger.json"
-# R11 DAILY_OPEN_DATA_HISTORY_SPLIT：政府資料開放平台 dataset 11549 指定之每日全市場資料來源。
-# 授權說明網址：http://data.gov.tw/license
-# OAS標準之API說明文件網址：https://openapi.twse.com.tw/v1/swagger.json
-TWSE_STOCK_DAY_ALL_OPEN_DATA_ENDPOINT = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data"
-TWSE_STOCK_DAY_ALL_OPENAPI_ENDPOINT = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
-TWSE_STOCK_DAY_SINGLE_HISTORY_ENDPOINT = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
 EXTERNAL_DATA_SOURCE_PRIORITY = [
     "TWSE OpenAPI / TWSE 官方 API",
     "TPEx 官方頁面 / CSV",
@@ -2219,162 +2212,9 @@ def parse_twse_mi_index_csv(csv_text: str) -> pd.DataFrame:
     return df[["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]].drop_duplicates(subset=["stock_id"])
 
 
-def _parse_official_daily_date(value) -> str:
-    """R11：解析 TWSE STOCK_DAY_ALL 的日期欄位，支援民國年與西元年。"""
-    s = str(value or "").strip().replace(".", "/").replace("-", "/")
-    m = re.match(r"^(\d{2,3})/(\d{1,2})/(\d{1,2})$", s)
-    if m:
-        return f"{int(m.group(1)) + 1911:04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    m = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", s)
-    if m:
-        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    m = re.match(r"^(\d{8})$", s)
-    if m:
-        return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
-    try:
-        return pd.to_datetime(s).strftime("%Y-%m-%d")
-    except Exception:
-        return datetime.now().strftime("%Y-%m-%d")
-
-
-def parse_twse_stock_day_all_records(data, source_name: str = "TWSE_STOCK_DAY_ALL") -> pd.DataFrame:
-    """R11：解析 TWSE 官方 STOCK_DAY_ALL 全市場每日盤後資料。
-
-    資料來源：
-    - https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data
-    - https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL
-
-    正確用途：每日增量更新。不可用此函式建立完整歷史，完整歷史只能走 STOCK_DAY 單股補歷史。
-    """
-    if data is None:
-        return pd.DataFrame()
-    try:
-        if isinstance(data, pd.DataFrame):
-            df = data.copy()
-        elif isinstance(data, list):
-            df = pd.DataFrame(data)
-        elif isinstance(data, dict):
-            df = pd.DataFrame(data.get("data") or data.get("records") or data.get("result") or [])
-        else:
-            return pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-    if df is None or df.empty:
-        return pd.DataFrame()
-
-    df = df.rename(columns={
-        "日期": "date", "Date": "date", "date": "date",
-        "證券代號": "stock_id", "Code": "stock_id", "SecuritiesCompanyCode": "stock_id", "公司代號": "stock_id",
-        "證券名稱": "stock_name", "Name": "stock_name", "公司名稱": "stock_name",
-        "成交股數": "volume", "TradingShares": "volume", "Volume": "volume",
-        "成交金額": "turnover", "TransactionAmount": "turnover", "Turnover": "turnover",
-        "開盤價": "open", "Open": "open",
-        "最高價": "high", "High": "high",
-        "最低價": "low", "Low": "low",
-        "收盤價": "close", "Close": "close",
-        "成交筆數": "trades", "Transaction": "trades",
-    })
-    required = ["stock_id", "open", "high", "low", "close", "volume"]
-    if not all(c in df.columns for c in required):
-        return pd.DataFrame()
-
-    df["stock_id"] = df["stock_id"].astype(str).str.strip().map(normalize_stock_id)
-    df = df[df["stock_id"].astype(str).str.fullmatch(r"\d{4,5}", na=False)].copy()
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", "", regex=False).str.replace("--", "", regex=False).str.strip(), errors="coerce")
-    if "turnover" in df.columns:
-        df["turnover"] = pd.to_numeric(df["turnover"].astype(str).str.replace(",", "", regex=False).str.replace("--", "", regex=False).str.strip(), errors="coerce")
-    else:
-        df["turnover"] = df["close"] * df["volume"].fillna(0)
-    if "date" in df.columns:
-        df["date"] = df["date"].map(_parse_official_daily_date)
-    else:
-        df["date"] = datetime.now().strftime("%Y-%m-%d")
-    df = df.dropna(subset=["close"])
-    if df.empty:
-        return df
-    df["source"] = source_name
-    return df[["stock_id", "date", "open", "high", "low", "close", "volume", "turnover"]].drop_duplicates(subset=["stock_id"], keep="last")
-
-
-def parse_twse_stock_day_all_open_data(csv_text: str) -> pd.DataFrame:
-    """R11：解析 STOCK_DAY_ALL?response=open_data CSV。"""
-    if not str(csv_text or "").strip():
-        return pd.DataFrame()
-    last_error = None
-    for enc in (None,):
-        try:
-            df = pd.read_csv(io.StringIO(csv_text), dtype=str).fillna("")
-            out = parse_twse_stock_day_all_records(df, source_name="TWSE_STOCK_DAY_ALL_OPEN_DATA")
-            if out is not None and not out.empty:
-                return out
-        except Exception as exc:
-            last_error = exc
-            continue
-    try:
-        # 某些環境回傳前面可能帶說明文字，退回 csv.reader 逐行解析。
-        rows = []
-        reader = csv.DictReader(io.StringIO(csv_text))
-        for row in reader:
-            rows.append(row)
-        return parse_twse_stock_day_all_records(rows, source_name="TWSE_STOCK_DAY_ALL_OPEN_DATA")
-    except Exception:
-        if last_error:
-            log_warning(f"[R11][STOCK_DAY_ALL][PARSE_WARN] {last_error}")
-        return pd.DataFrame()
-
-
-def download_twse_official_daily_csv(date_str: str | None = None, fallback_days: int = 10, log_cb=None) -> pd.DataFrame:
-    """R11：每日增量更新優先使用 TWSE STOCK_DAY_ALL 全市場 OpenData。
-
-    正確分工：
-    1) 每日增量更新：STOCK_DAY_ALL?response=open_data，一次取得上市全市場每日盤後資料。
-    2) 單股補歷史：STOCK_DAY?response=json&date=YYYYMM01&stockNo=xxxx。
-    3) MI_INDEX 僅保留最後備援，不再當每日更新主來源。
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://www.twse.com.tw/",
-        "Accept": "text/csv, application/json, text/plain, */*",
-    }
-
-    # 第一層：政府資料開放平台 dataset 11549 對應之 OpenData CSV，一次抓全市場。
-    try:
-        resp = requests.get(TWSE_STOCK_DAY_ALL_OPEN_DATA_ENDPOINT, headers=headers, timeout=30)
-        resp.raise_for_status()
-        if not resp.encoding or str(resp.encoding).lower() in ("iso-8859-1", "ascii"):
-            resp.encoding = "utf-8"
-        df = parse_twse_stock_day_all_open_data(resp.text)
-        if df is not None and not df.empty:
-            df.attrs["source"] = "TWSE_STOCK_DAY_ALL_OPEN_DATA"
-            if log_cb:
-                log_cb(f"[DAILY][TWSE][OPEN_DATA][OK] rows={len(df)} source={TWSE_STOCK_DAY_ALL_OPEN_DATA_ENDPOINT}")
-            return df
-        if log_cb:
-            log_cb(f"[DAILY][TWSE][OPEN_DATA][WARN] no rows content_type={resp.headers.get('Content-Type','')}")
-    except Exception as exc:
-        if log_cb:
-            log_cb(f"[DAILY][TWSE][OPEN_DATA][WARN] {exc}")
-
-    # 第二層：TWSE OpenAPI JSON。
-    try:
-        resp = requests.get(TWSE_STOCK_DAY_ALL_OPENAPI_ENDPOINT, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        df = parse_twse_stock_day_all_records(data, source_name="TWSE_STOCK_DAY_ALL_OPENAPI")
-        if df is not None and not df.empty:
-            df.attrs["source"] = "TWSE_STOCK_DAY_ALL_OPENAPI"
-            if log_cb:
-                log_cb(f"[DAILY][TWSE][OPENAPI][OK] rows={len(df)} source={TWSE_STOCK_DAY_ALL_OPENAPI_ENDPOINT}")
-            return df
-        if log_cb:
-            log_cb("[DAILY][TWSE][OPENAPI][WARN] no rows")
-    except Exception as exc:
-        if log_cb:
-            log_cb(f"[DAILY][TWSE][OPENAPI][WARN] {exc}")
-
-    # 第三層：舊 MI_INDEX CSV 只作最後備援。
+def download_twse_official_daily_csv(date_str: str | None = None, fallback_days: int = 10) -> pd.DataFrame:
     base_date = datetime.strptime(date_str, "%Y%m%d") if date_str else datetime.now()
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
     for offset in range(fallback_days + 1):
         use_date = (base_date - pd.Timedelta(days=offset)).strftime("%Y%m%d")
         url = f"https://www.twse.com.tw/exchangeReport/MI_INDEX?response=csv&date={use_date}&type=ALLBUT0999"
@@ -2383,13 +2223,8 @@ def download_twse_official_daily_csv(date_str: str | None = None, fallback_days:
             resp.raise_for_status()
             df = parse_twse_mi_index_csv(resp.text)
             if df is not None and not df.empty:
-                df.attrs["source"] = "TWSE_MI_INDEX_LEGACY_FALLBACK"
-                if log_cb:
-                    log_cb(f"[DAILY][TWSE][MI_INDEX_FALLBACK][OK] rows={len(df)} date={use_date}")
                 return df
-        except Exception as exc:
-            if log_cb and offset == 0:
-                log_cb(f"[DAILY][TWSE][MI_INDEX_FALLBACK][WARN] {exc}")
+        except Exception:
             continue
     return pd.DataFrame()
 
@@ -3733,15 +3568,13 @@ class DataEngine:
     def _to_num(series: pd.Series) -> pd.Series:
         return pd.to_numeric(series.astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
 
-    def fetch_twse_daily(self, log_cb=None) -> pd.DataFrame:
-        """R11：上市每日資料只走全市場官方快取，不逐檔抓歷史 API。"""
+    def fetch_twse_daily(self) -> pd.DataFrame:
         try:
-            df = download_twse_official_daily_csv(log_cb=log_cb)
+            df = download_twse_official_daily_csv()
             if df is not None and not df.empty:
                 return df
-        except Exception as exc:
-            if log_cb:
-                log_cb(f"[DAILY][TWSE][WARN] 全市場官方每日資料失敗：{exc}")
+        except Exception:
+            pass
         return pd.DataFrame()
 
     def fetch_tpex_daily(self) -> pd.DataFrame:
@@ -3786,393 +3619,7 @@ class DataEngine:
         if not parts:
             return pd.DataFrame()
         return pd.concat(parts, ignore_index=True).drop_duplicates(subset=["stock_id"])
-
-
-    # V17-R5 HISTORY_OFFICIAL_FIRST：完整歷史建庫改為官方主、Yahoo輔。
-    # 原則：TWSE / TPEx 官方逐月歷史先補 price_history；官方完全無資料時才啟用 Yahoo fallback。
-    @staticmethod
-    def _clean_number_value(value):
-        s = str(value or "").strip().replace(",", "").replace("--", "").replace("X", "")
-        if s in ("", "-", "nan", "None", "NaN", "null", "NULL"):
-            return np.nan
-        try:
-            return float(s)
-        except Exception:
-            return np.nan
-
-    @staticmethod
-    def _parse_tw_date(value: str) -> str:
-        """支援 TWSE/TPEx 民國年日期 113/01/02 或西元 YYYY-MM-DD。"""
-        s = str(value or "").strip().replace(".", "/").replace("-", "/")
-        m = re.match(r"^(\d{2,3})/(\d{1,2})/(\d{1,2})$", s)
-        if m:
-            y = int(m.group(1)) + 1911
-            return f"{y:04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-        m = re.match(r"^(\d{4})/(\d{1,2})/(\d{1,2})$", s)
-        if m:
-            return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-        try:
-            return pd.to_datetime(s).strftime("%Y-%m-%d")
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _month_start_list(months: int = 30) -> list[str]:
-        base = pd.Timestamp(datetime.now().date()).replace(day=1)
-        return [(base - pd.DateOffset(months=i)).strftime("%Y%m01") for i in range(int(months or 30))]
-
-    @staticmethod
-    def _to_tpex_roc_month(yyyymm01: str) -> str:
-        dt = pd.to_datetime(str(yyyymm01), format="%Y%m%d", errors="coerce")
-        if pd.isna(dt):
-            dt = pd.Timestamp(datetime.now().date()).replace(day=1)
-        return f"{int(dt.year) - 1911}/{int(dt.month):02d}"
-
-    @staticmethod
-    def _to_tpex_query_month(yyyymm01: str) -> str:
-        """R10-HISTORY-FIX2：TPEx 新版 /www/zh-tw/afterTrading/tradingStock 使用西元 YYYY/MM/01。
-
-        注意：這裡不是民國年月。
-        正確範例：
-            https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock?code=3455&date=2023%2F10%2F01&id=&response=html
-
-        前版錯把 date 帶成 113/05，會被導到 /errors 404 HTML。
-        """
-        dt = pd.to_datetime(str(yyyymm01), format="%Y%m%d", errors="coerce")
-        if pd.isna(dt):
-            dt = pd.Timestamp(datetime.now().date()).replace(day=1)
-        return f"{int(dt.year):04d}/{int(dt.month):02d}/01"
-
-    def fetch_twse_history_official(self, stock_id: str, months: int = 30, log_cb=None) -> pd.DataFrame:
-        """TWSE 官方 STOCK_DAY 逐月歷史資料。"""
-        stock_id = normalize_stock_id(stock_id)
-        if not stock_id:
-            return pd.DataFrame()
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.twse.com.tw/"}
-        rows = []
-        for yyyymm01 in self._month_start_list(months):
-            url = f"https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={yyyymm01}&stockNo={stock_id}"
-            try:
-                res = requests.get(url, headers=headers, timeout=20)
-                if res.status_code != 200:
-                    continue
-                payload = res.json()
-                data = payload.get("data") if isinstance(payload, dict) else None
-                if not data:
-                    continue
-                for r in data:
-                    if not isinstance(r, (list, tuple)) or len(r) < 7:
-                        continue
-                    trade_date = self._parse_tw_date(r[0])
-                    if not trade_date:
-                        continue
-                    volume = self._clean_number_value(r[1])
-                    turnover = self._clean_number_value(r[2])
-                    open_p = self._clean_number_value(r[3])
-                    high_p = self._clean_number_value(r[4])
-                    low_p = self._clean_number_value(r[5])
-                    close_p = self._clean_number_value(r[6])
-                    if pd.isna(close_p):
-                        continue
-                    rows.append({
-                        "date": trade_date, "open": open_p, "high": high_p, "low": low_p,
-                        "close": close_p, "volume": volume, "turnover": turnover,
-                    })
-            except Exception as exc:
-                if log_cb:
-                    log_cb(f"[HISTORY][TWSE][WARN] {stock_id} {yyyymm01} 官方歷史讀取失敗：{exc}")
-                continue
-            time.sleep(0.03)
-        if not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows).drop_duplicates(subset=["date"], keep="last").sort_values("date")
-        for c in ["open", "high", "low", "close", "volume", "turnover"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["close"])
-        df.attrs["source"] = "TWSE_OFFICIAL_STOCK_DAY"
-        return df[["date", "open", "high", "low", "close", "volume", "turnover"]]
-
-    @staticmethod
-    def _extract_tpex_history_rows(payload=None, html_text: str = "", csv_text: str = "", log_cb=None) -> list[dict]:
-        """R10-HISTORY-FIX2：TPEx 個股歷史資料解析器。
-
-        支援：
-        1) 新版 TPEx JSON：tables[0].data / data / aaData / records。
-        2) 新版 TPEx HTML table：/www/zh-tw/afterTrading/tradingStock?code=xxxx&date=YYYY/MM/01&id=&response=html。
-        3) CSV fallback：response=csv / response=csv-download 類型。
-        4) 舊版 st43_result.php aaData / tables data。
-
-        TPEx 歷史欄位多為「成交仟股 / 成交仟元」，寫入 price_history 前需乘 1000。
-        回傳欄位固定：date/open/high/low/close/volume/turnover。
-        """
-        parsed_rows: list[dict] = []
-
-        def _pick_dict_value(d: dict, keys: list[str]):
-            for k in keys:
-                if k in d and str(d.get(k, "")).strip() != "":
-                    return d.get(k)
-            # pandas read_html 可能產生多層欄位或帶空白，做一次模糊比對。
-            for dk, dv in d.items():
-                dks = str(dk).replace(" ", "").strip()
-                for k in keys:
-                    if str(k).replace(" ", "").strip() == dks and str(dv).strip() != "":
-                        return dv
-            return ""
-
-        def _append_row(r):
-            if r is None:
-                return
-            volume_is_thousand = False
-            turnover_is_thousand = False
-            if isinstance(r, dict):
-                date_v = _pick_dict_value(r, ["日期", "日 期", "Date", "date", "成交日期", "trade_date"])
-                volume_v = _pick_dict_value(r, ["成交仟股", "成交股數", "成交數量", "成交量", "Volume", "volume"])
-                turnover_v = _pick_dict_value(r, ["成交仟元", "成交金額", "成交值", "Turnover", "turnover"])
-                open_v = _pick_dict_value(r, ["開盤", "開盤價", "Open", "open"])
-                high_v = _pick_dict_value(r, ["最高", "最高價", "High", "high"])
-                low_v = _pick_dict_value(r, ["最低", "最低價", "Low", "low"])
-                close_v = _pick_dict_value(r, ["收盤", "收盤價", "Close", "close"])
-                joined_keys = " ".join(str(k) for k in r.keys())
-                volume_is_thousand = "成交仟股" in joined_keys
-                turnover_is_thousand = "成交仟元" in joined_keys
-            elif isinstance(r, (list, tuple)) and len(r) >= 7:
-                # TPEx 常見順序：日期、成交仟股、成交仟元、開盤、最高、最低、收盤、漲跌、筆數
-                date_v, volume_v, turnover_v, open_v, high_v, low_v, close_v = r[:7]
-                volume_is_thousand = True
-                turnover_is_thousand = True
-            else:
-                return
-
-            trade_date = DataEngine._parse_tw_date(str(date_v).replace("*", ""))
-            close_p = DataEngine._clean_number_value(close_v)
-            if not trade_date or pd.isna(close_p):
-                return
-
-            volume = DataEngine._clean_number_value(volume_v)
-            turnover = DataEngine._clean_number_value(turnover_v)
-            if not pd.isna(volume) and volume_is_thousand:
-                volume = float(volume) * 1000.0
-            if not pd.isna(turnover) and turnover_is_thousand:
-                turnover = float(turnover) * 1000.0
-
-            parsed_rows.append({
-                "date": trade_date,
-                "open": DataEngine._clean_number_value(open_v),
-                "high": DataEngine._clean_number_value(high_v),
-                "low": DataEngine._clean_number_value(low_v),
-                "close": close_p,
-                "volume": volume,
-                "turnover": turnover,
-            })
-
-        if isinstance(payload, dict):
-            data = payload.get("data") or payload.get("aaData") or payload.get("records") or []
-            if not data and isinstance(payload.get("tables"), list):
-                for t in payload.get("tables") or []:
-                    if isinstance(t, dict):
-                        data = t.get("data") or t.get("aaData") or t.get("rows") or []
-                        if data:
-                            break
-            for r in data or []:
-                _append_row(r)
-        elif isinstance(payload, list):
-            for r in payload:
-                _append_row(r)
-
-        if parsed_rows:
-            return parsed_rows
-
-        html_text = str(html_text or "")
-        if "<table" in html_text.lower():
-            try:
-                tables = pd.read_html(io.StringIO(html_text))
-                for table in tables:
-                    if table is None or table.empty:
-                        continue
-                    t = table.copy()
-                    # 處理 multi-index header。
-                    if isinstance(t.columns, pd.MultiIndex):
-                        t.columns = [" ".join([str(x) for x in col if str(x) != "nan"]).strip() for col in t.columns]
-                    else:
-                        t.columns = [str(c).strip() for c in t.columns]
-                    if any("日期" in str(c) or "日 期" in str(c) for c in t.columns):
-                        for rec in t.to_dict("records"):
-                            _append_row(rec)
-                    else:
-                        for row in t.values.tolist():
-                            _append_row(row)
-                    if parsed_rows:
-                        break
-            except Exception as exc:
-                if log_cb:
-                    log_cb(f"[HISTORY][TPEX][HTML_PARSE_WARN] HTML table fallback 解析失敗：{exc}")
-        if parsed_rows:
-            return parsed_rows
-
-        csv_text = str(csv_text or "")
-        if csv_text.strip():
-            try:
-                csv_df = pd.read_csv(io.StringIO(csv_text), dtype=str).fillna("")
-                if not csv_df.empty:
-                    for rec in csv_df.to_dict("records"):
-                        _append_row(rec)
-            except Exception:
-                try:
-                    csv_df = pd.read_csv(io.StringIO(csv_text), dtype=str, encoding="utf-8").fillna("")
-                    if not csv_df.empty:
-                        for rec in csv_df.to_dict("records"):
-                            _append_row(rec)
-                except Exception as exc:
-                    if log_cb:
-                        log_cb(f"[HISTORY][TPEX][CSV_PARSE_WARN] CSV fallback 解析失敗：{exc}")
-        return parsed_rows
-
-    def fetch_tpex_history_official(self, stock_id: str, months: int = 30, log_cb=None) -> pd.DataFrame:
-        """TPEx 官方個股日成交歷史資料。
-
-        R10-HISTORY-FIX2：
-        - 只修 TPEx 歷史來源，不動 build_full_history / price_history / TWSE 架構。
-        - 修正新版 TPEx URL 日期參數：必須使用西元 YYYY/MM/01，不是民國 113/05。
-        - 官方主路徑：
-          https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock?code=00638&date=2024%2F05%2F01&id=&response=json
-        - JSON 若無資料，改試 HTML / CSV；舊版 st43_result.php 僅保留為最後相容。
-        - 加入 Content-Type / status_code / final_url / response preview，避免再次誤判為「官方沒資料」。
-        """
-        stock_id = normalize_stock_id(stock_id)
-        if not stock_id:
-            return pd.DataFrame()
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json, text/html, text/csv, */*",
-            "Referer": "https://www.tpex.org.tw/zh-tw/mainboard/trading/info/stock-pricing.html",
-        }
-        rows = []
-        for yyyymm01 in self._month_start_list(months):
-            query_month = self._to_tpex_query_month(yyyymm01)   # 正確：西元 YYYY/MM/01
-            roc_month = self._to_tpex_roc_month(yyyymm01)       # 僅供舊版 endpoint 與 log
-            request_candidates = [
-                # 新版官方資料端點：json 優先。
-                ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock",
-                 {"code": stock_id, "date": query_month, "id": "", "response": "json"}, "json-main"),
-                # 新版官方資料端點：HTML fallback，網頁可直接看到表格。
-                ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock",
-                 {"code": stock_id, "date": query_month, "id": "", "response": "html"}, "html-main"),
-                # 新版官方資料端點：CSV fallback。
-                ("https://www.tpex.org.tw/www/zh-tw/afterTrading/tradingStock",
-                 {"code": stock_id, "date": query_month, "id": "", "response": "csv"}, "csv-main"),
-                # 舊版相容：舊版使用民國年月。
-                (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={quote(roc_month, safe='')}&stkno={stock_id}",
-                 None, "legacy-st43-encoded"),
-                (f"https://www.tpex.org.tw/web/stock/aftertrading/daily_trading_info/st43_result.php?l=zh-tw&d={roc_month}&stkno={stock_id}",
-                 None, "legacy-st43-raw"),
-            ]
-
-            month_rows = []
-            last_error = ""
-            for url, params, tag in request_candidates:
-                try:
-                    res = requests.get(url, params=params, headers=headers, timeout=25)
-                    content_type = str(res.headers.get("Content-Type", ""))
-                    final_url = getattr(res, "url", url)
-                    # requests 通常可自動判斷；若 TPEx 回中文 HTML/CSV，強制 utf-8 讓 preview 與 read_html 較穩。
-                    if not res.encoding or str(res.encoding).lower() in ("iso-8859-1", "ascii"):
-                        res.encoding = "utf-8"
-                    text_body = res.text or ""
-                    if res.status_code != 200:
-                        preview = re.sub(r"\s+", " ", text_body[:300]).strip()
-                        last_error = f"{tag} HTTP {res.status_code} content_type={content_type} url={final_url} preview={preview}"
-                        continue
-
-                    payload = None
-                    json_error = ""
-                    if "json" in content_type.lower() or text_body.lstrip().startswith(("{", "[")):
-                        try:
-                            payload = res.json()
-                        except Exception as exc:
-                            json_error = str(exc)
-                    else:
-                        json_error = f"non_json_content_type={content_type}"
-
-                    csv_text = text_body if ("csv" in content_type.lower() or tag.startswith("csv")) else ""
-                    month_rows = self._extract_tpex_history_rows(
-                        payload=payload,
-                        html_text=text_body,
-                        csv_text=csv_text,
-                        log_cb=log_cb,
-                    )
-                    if month_rows:
-                        rows.extend(month_rows)
-                        if log_cb:
-                            log_cb(f"[HISTORY][TPEX][OK] {stock_id} {query_month} rows={len(month_rows)} source={tag} url={final_url}")
-                        break
-
-                    preview = re.sub(r"\s+", " ", text_body[:300]).strip()
-                    last_error = f"{tag} no_rows content_type={content_type} json_error={json_error} url={final_url} preview={preview}"
-                except Exception as exc:
-                    last_error = f"{tag} request_failed url={url} params={params} exc={exc}"
-                    continue
-
-            if not month_rows and log_cb:
-                log_cb(f"[HISTORY][TPEX][WARN] {stock_id} {query_month} 官方歷史讀取失敗：{last_error}")
-            time.sleep(0.03)
-        if not rows:
-            return pd.DataFrame()
-        df = pd.DataFrame(rows).drop_duplicates(subset=["date"], keep="last").sort_values("date")
-        for c in ["open", "high", "low", "close", "volume", "turnover"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["close"])
-        df.attrs["source"] = "TPEX_OFFICIAL_HISTORY_R10_FIX2"
-        return df[["date", "open", "high", "low", "close", "volume", "turnover"]]
-
-    def download_history_official_first(self, stock_id: str, market: str, months: int = 30, log_cb=None) -> pd.DataFrame:
-        """完整歷史建庫統一入口：官方主、Yahoo輔。
-
-        R11 分工限制：
-        - 本函式只允許 build_full_history / 單股補洞使用。
-        - 每日增量更新不得呼叫本函式，避免 2267 檔 × 月份 的重型 request 鏈。
-        """
-        stock_id = normalize_stock_id(stock_id)
-        market_text = str(market or "").strip()
-        # R10-HISTORY-FIX：市場判斷只決定官方查詢順序，不直接排除另一個市場。
-        # 上櫃先 TPEx；上市先 TWSE；ETF/00開頭先 TWSE 再 TPEx，避免上櫃 ETF 或特殊代號漏抓。
-        if market_text == "上櫃":
-            official_candidates = [self.fetch_tpex_history_official, self.fetch_twse_history_official]
-        elif market_text == "ETF" or stock_id.startswith("00"):
-            official_candidates = [self.fetch_twse_history_official, self.fetch_tpex_history_official]
-        else:
-            official_candidates = [self.fetch_twse_history_official, self.fetch_tpex_history_official]
-
-        for fetcher in official_candidates:
-            try:
-                df = fetcher(stock_id, months=months, log_cb=log_cb)
-                if df is not None and not df.empty:
-                    if log_cb:
-                        log_cb(f"[HISTORY][OFFICIAL][OK] {stock_id} rows={len(df)} source={df.attrs.get('source','official')}")
-                    return df
-            except Exception as exc:
-                if log_cb:
-                    log_cb(f"[HISTORY][OFFICIAL][WARN] {stock_id} {fetcher.__name__} failed：{exc}")
-                continue
-
-        if log_cb:
-            log_cb(f"[HISTORY][FALLBACK] {stock_id} 官方歷史無資料，改用 Yahoo 備援")
-        df = self.download_history_yahoo_only(stock_id, market_text, period="2y")
-        if df is not None and not df.empty:
-            df.attrs["source"] = "YAHOO_FALLBACK"
-        return df
     def download_history(self, stock_id: str, market: str, period: str = "2y") -> pd.DataFrame:
-        """V17-R5：相容舊呼叫名稱，但內部改為官方主、Yahoo備援。"""
-        months = 30
-        try:
-            # period=2y 約等於 24 個月；保留 30 個月讓指標有足夠緩衝。
-            m = re.match(r"^(\d+)y$", str(period or "").strip().lower())
-            if m:
-                months = max(int(m.group(1)) * 12 + 6, 12)
-        except Exception:
-            months = 30
-        return self.download_history_official_first(stock_id, market, months=months)
-
-    def download_history_yahoo_only(self, stock_id: str, market: str, period: str = "2y") -> pd.DataFrame:
         if yf is None:
             return pd.DataFrame()
         symbols = []
@@ -4256,9 +3703,6 @@ class DataEngine:
         failed = 0
         rows = 0
         total = len(master)
-        if log_cb:
-            log_cb("[HISTORY][POLICY] 完整歷史建庫=只補 price_history 不足 min_days 的個股；來源順序：TWSE/TPEx 單股月歷史 → Yahoo備援。")
-            log_cb("[HISTORY][POLICY] 每日增量更新不得使用本流程；每日更新請使用 STOCK_DAY_ALL / TPEx OpenAPI 全市場資料。")
         for idx, (_, row) in enumerate(master.iterrows(), start=1):
             if cancel_cb and cancel_cb():
                 raise OperationCancelled("使用者中斷完整歷史建庫")
@@ -4272,20 +3716,20 @@ class DataEngine:
                     log_cb(f"[{idx}/{total}] {stock_id} 已具備 {existing} 筆歷史，跳過")
                 continue
             try:
-                hist_df = self.download_history_official_first(stock_id, market, months=30, log_cb=log_cb)
+                hist_df = self.download_history(stock_id, market, period="2y")
                 if hist_df is not None and not hist_df.empty:
                     self.db.upsert_price_history(stock_id, hist_df)
                     success += 1
                     rows += len(hist_df)
                     current_count = self.db.get_price_history_count(stock_id)
                     if log_cb:
-                        log_cb(f"[{idx}/{total}] {stock_id} 補建成功，新增/覆蓋 {len(hist_df)} 筆，累計 {current_count} 筆｜來源 {hist_df.attrs.get('source', 'unknown')}")
+                        log_cb(f"[{idx}/{total}] {stock_id} 補建成功，新增/覆蓋 {len(hist_df)} 筆，累計 {current_count} 筆")
                     if progress_cb:
                         progress_cb(idx, total, stock_id, current_count, "ok")
                 else:
                     failed += 1
                     if log_cb:
-                        log_cb(f"[{idx}/{total}] {stock_id} 無可用歷史資料｜官方與Yahoo備援皆失敗")
+                        log_cb(f"[{idx}/{total}] {stock_id} 無可用歷史資料")
                     if progress_cb:
                         progress_cb(idx, total, stock_id, existing, "fail")
             except Exception as e:
@@ -4305,13 +3749,8 @@ class DataEngine:
         if master.empty:
             return 0, 0, 0
 
-        # R11：每日增量更新主流程只讀全市場官方日資料，不使用單股歷史 API 當每日更新來源。
-        twse_df = self.fetch_twse_daily(log_cb=log_cb)
+        twse_df = self.fetch_twse_daily()
         tpex_df = self.fetch_tpex_daily()
-
-        if log_cb:
-            log_cb(f"[DAILY][OFFICIAL_MAP] TWSE_STOCK_DAY_ALL rows={0 if twse_df is None or twse_df.empty else len(twse_df)}｜TPEx_OpenAPI rows={0 if tpex_df is None or tpex_df.empty else len(tpex_df)}")
-            log_cb("[DAILY][POLICY] 每日增量=STOCK_DAY_ALL/OpenAPI 全市場資料；單股 STOCK_DAY 只用於完整歷史補洞。")
 
         official_map = {}
         if not twse_df.empty:
@@ -4516,11 +3955,6 @@ class RankingEngine:
         self.db = db
 
     def rebuild(self, progress_cb=None, log_cb=None, cancel_cb=None, rank_mode: str = "fast", allow_external_api: bool = False, allow_eps_build: bool = False, allow_financial_feature_write: bool = False, teacher_mode: str = "light"):
-        rank_mode_norm = str(rank_mode or "fast").lower()
-        if rank_mode_norm == "fast" and (allow_external_api or allow_eps_build or allow_financial_feature_write):
-            raise WorkflowViolation("FAST_RANK_REBUILD 禁止 external_api / eps_build / financial_feature_write")
-        if rank_mode_norm == "fast" and str(teacher_mode or "light").lower() != "light":
-            raise WorkflowViolation("FAST_RANK_REBUILD 只能 teacher_mode=light，不得 full merge")
         master = self.db.get_master()
         today = datetime.now().strftime("%Y-%m-%d")
         rows = []
@@ -4625,6 +4059,9 @@ class RankingEngine:
         merged = df.merge(master[["stock_id", "industry"]], on="stock_id", how="left")
         df["rank_industry"] = merged.groupby("industry")["total_score"].rank(method="dense", ascending=False).astype(int)
         if str(rank_mode).lower() == "fast" or str(teacher_mode).lower() == "light":
+            # [DISABLED_V13_MINIMAL_STOP_EXTRA]
+            # 快速重算排行只允許 Teacher Snapshot 輕量合併，禁止 TeacherStrategy full merge。
+            # 目的：停止「重建排行」重覆跑老師策略全量流程；每日增量更新仍可用 teacher_mode="full"。
             # V17 WORKFLOW_SPLIT：快速重算排行只允許 Teacher Snapshot 輕量合併，禁止 full merge。
             try:
                 teacher_snap = self.db.get_latest_teacher_strategy_snapshot()
@@ -4655,6 +4092,8 @@ class RankingEngine:
                 log_warning(f"{warn}｜run_id={run_id}")
                 df = finalize_teacher_strategy_fields(df)
         else:
+            # [DAILY_UPDATE_ONLY_KEEP]
+            # 保留每日增量更新後的 TeacherStrategy full merge；不屬於快速重建排行。
             df = apply_teacher_strategy_pipeline_safe(df, price_history_df=None, context="daily_update_after_ranking", log_cb=log_cb)
         self.db.replace_ranking(df)
         self.db.log_system_run(event="ranking_rebuild", status="ok", message=f"ranking rows={len(df)} with FUNDAMENTAL_LOCAL_CACHE", run_id=run_id, module="ranking")
@@ -7381,7 +6820,11 @@ class DecisionLayerEngine:
             out["ui_state"] = "可交易-部分外部資料NE"
         if eps_matrix_decision_note:
             out["decision_reason_short"] = short_reason(str(out.get("decision_reason_short", "")) + "｜" + eps_matrix_decision_note, 160)
-        log_info(f"[EPS MATRIX][DECISION] stock={stock_id} cat={eps_category} cell={matrix_cell} score={revenue_eps_score} trade_allowed={trade_allowed}")
+        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
+        # 停用逐檔 EPS MATRIX DECISION INFO log。
+        # 原因：快速重算排行 / TOP20 / UI refresh 若誤入決策鏈，會大量刷 2000+ 筆 log 並拖慢 MainThread。
+        # 如需除錯，請臨時打開下方 log。
+        # log_info(f"[EPS MATRIX][DECISION] stock={stock_id} cat={eps_category} cell={matrix_cell} score={revenue_eps_score} trade_allowed={trade_allowed}")
         return out
 
     def evaluate_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -9710,14 +9153,17 @@ class MasterTradingEngine:
 
         base = filtered_df.copy()
         hot_themes = ThemeStrengthEngine.get_hot_themes(base)
-        try:
-            feature_rows = FinancialFeatureEngine(self.db).build_feature_batch(write_db=True, log_limit=0)
-            if log_cb:
-                log_cb(f"[EPS MATRIX][BUILD] AI選股前已更新 financial_feature_daily：{0 if feature_rows is None else len(feature_rows)} 筆")
-        except Exception as exc:
-            log_warning(f"[EPS MATRIX][BUILD][WARN] AI選股前 feature 建立失敗：{exc}")
-            if log_cb:
-                log_cb(f"[EPS MATRIX][BUILD][WARN] {exc}")
+        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
+        # AI選股 / get_trade_pool 不得再建立 financial_feature_daily。
+        # EPS Matrix Build 應只在「每日增量更新」重型入口執行；TOP20 / UI 顯示只能讀取快取。
+        # try:
+        #     feature_rows = FinancialFeatureEngine(self.db).build_feature_batch(write_db=True, log_limit=0)
+        #     if log_cb:
+        #         log_cb(f"[EPS MATRIX][BUILD] AI選股前已更新 financial_feature_daily：{0 if feature_rows is None else len(feature_rows)} 筆")
+        # except Exception as exc:
+        #     log_warning(f"[EPS MATRIX][BUILD][WARN] AI選股前 feature 建立失敗：{exc}")
+        #     if log_cb:
+        #         log_cb(f"[EPS MATRIX][BUILD][WARN] {exc}")
 
         plans = []
         sids = base["stock_id"].astype(str).tolist()
@@ -10480,9 +9926,9 @@ class AppUI:
                 self.workflow_orchestrator = GTCWorkflowOrchestrator(
                     logger=APP_LOGGER,
                     log_cb=lambda msg: self.ui_call(self.append_log, msg),
-                    strict=True,
+                    strict=False,
                 )
-                log_info("[WORKFLOW] Orchestrator initialized in AppUI.__init__｜strict=True")
+                log_info("[WORKFLOW] Orchestrator initialized in AppUI.__init__")
             else:
                 log_warning(f"[WORKFLOW] Orchestrator unavailable: {WORKFLOW_ORCHESTRATOR_IMPORT_STATUS}")
         except Exception as exc:
@@ -10563,53 +10009,6 @@ class AppUI:
 
     def update_status(self, msg: str):
         self.ui_call(self.set_status, msg)
-
-    def _workflow_required_or_abort(self, workflow_name: str) -> bool:
-        """P0：四大流程必須經由 workflow_orchestrator 總閘。
-        若封裝缺檔或 import 失敗，不允許回到舊版 fallback 流程，以免再次混入重覆工作。
-        """
-        if getattr(self, "workflow_orchestrator", None) is not None:
-            return True
-        msg = f"[WORKFLOW][P0][ABORT] {workflow_name} 已停止：workflow_orchestrator 未載入｜{WORKFLOW_ORCHESTRATOR_IMPORT_STATUS}"
-        try:
-            self.ui_call(self.append_log, msg, "ERROR")
-        except Exception:
-            log_error(msg)
-        try:
-            self.ui_call(messagebox.showerror, "Workflow 總閘未載入", msg)
-        except Exception:
-            pass
-        return False
-
-    def _refresh_master_status_only(self):
-        """初始化/建庫後只刷新主檔與狀態，不觸發排行、Teacher、AI TOP20。"""
-        try:
-            self.refresh_filters()
-        except Exception:
-            pass
-        try:
-            self.refresh_classification_summary_ui()
-        except Exception:
-            pass
-        try:
-            self.show_welcome_message()
-        except Exception:
-            pass
-
-    def _refresh_rank_result_only(self):
-        """重建排行後只刷新排行與快照相關 UI，不走 refresh_all_tables。"""
-        try:
-            self._reload_rank_tree_after_rebuild(True)
-        except Exception:
-            pass
-        try:
-            self.refresh_top20_and_order_views()
-        except Exception:
-            pass
-        try:
-            self.refresh_classification_summary_ui()
-        except Exception:
-            pass
 
     def _configure_startup_window(self):
         """啟動時自動貼齊可視區域，避免主視窗超出螢幕範圍。"""
@@ -13423,10 +12822,8 @@ class AppUI:
 
         def worker():
             try:
-                if not self._workflow_required_or_abort("建立完整歷史"):
-                    return
                 self.ui_call(self.clear_log)
-                self.ui_call(self.append_log, f"[WORKFLOW][BUILD_FULL_HISTORY] START｜模式={'續跑' if resume else '一般'}｜主檔 {total} 檔")
+                self.ui_call(self.append_log, f"開始完整建庫，模式={'續跑' if resume else '一般'}，主檔 {total} 檔")
                 self.ui_call(self.set_status, "開始建立完整歷史資料（分批 / 可中斷 / 可續跑）...")
                 self.ui_call(self.start_task, "建立完整歷史", total)
                 self.ui_call(self.update_task, "建立完整歷史", 0, total, 0, 0, 0, "準備中")
@@ -13452,19 +12849,13 @@ class AppUI:
                     if idx % 10 == 0 or idx == total_count:
                         self.ui_call(self.set_status, f"建立歷史中 {idx}/{total_count}｜{sid}｜成功 {counters['ok']}｜失敗 {counters['fail']}")
 
-                def _build_history_fn(**_kwargs):
-                    return self.data_engine.build_full_history(
-                        batch_size=self.history_batch_size,
-                        sleep_sec=self.history_sleep_sec,
-                        progress_cb=progress,
-                        log_cb=lambda msg: self.ui_call(self.append_log, msg),
-                        cancel_cb=lambda: self.cancel_event.is_set(),
-                    )
-                result = self.workflow_orchestrator.build_full_history(
-                    build_history_fn=_build_history_fn,
-                    refresh_ui_fn=lambda **_kw: self.ui_call(self._refresh_master_status_only),
+                success, failed, rows = self.data_engine.build_full_history(
+                    batch_size=self.history_batch_size,
+                    sleep_sec=self.history_sleep_sec,
+                    progress_cb=progress,
+                    log_cb=lambda msg: self.ui_call(self.append_log, msg),
+                    cancel_cb=lambda: self.cancel_event.is_set(),
                 )
-                success, failed, rows = result.get("history", (0, 0, 0))
                 self.clear_history_state()
                 self.ui_call(self.update_task, "建立完整歷史", total, total, success, failed, 0, "完成")
                 self.ui_call(self.set_status, f"完整歷史建立完成：成功 {success} 檔，失敗 {failed} 檔，寫入 {rows} 筆。")
@@ -13495,35 +12886,29 @@ class AppUI:
 
         def worker():
             try:
-                if not self._workflow_required_or_abort("初始化全市場"):
-                    return
                 self.ui_call(self.set_status, "開始初始化全市場股票清單...")
                 self.ui_call(self.start_task, "初始化全市場", 4)
                 self.ui_call(self.update_task, "初始化全市場", 1, 4, item="抓取主檔")
-
-                def _build_universe_fn(**_kwargs):
-                    return build_full_market_universe()
-
-                def _import_master_fn(universe_df, **_kwargs):
-                    if universe_df is None or getattr(universe_df, "empty", True):
-                        csv_path = resolve_master_csv()
-                        self.db.import_master_csv(csv_path)
-                        return {"source": "local_csv", "path": str(csv_path)}
-                    self.db.import_master_df(universe_df)
-                    return {"source": "official_or_mixed", "rows": len(universe_df)}
-
-                self.workflow_orchestrator.initialize_market(
-                    build_universe_fn=_build_universe_fn,
-                    import_master_fn=_import_master_fn,
-                    classification_qa_fn=lambda **_kw: get_classification_v2_summary(),
-                    refresh_ui_fn=lambda **_kw: self.ui_call(self._refresh_master_status_only),
-                )
-
+                universe = build_full_market_universe()
+                if universe is None or universe.empty:
+                    csv_path = resolve_master_csv()
+                    self.db.import_master_csv(csv_path)
+                    master2 = self.db.get_master()
+                    self.ui_call(self.refresh_filters)
+                    self.ui_call(self.refresh_all_tables)
+                    self.ui_call(self.refresh_classification_summary_ui)
+                    self.ui_call(self.update_task, "初始化全市場", 4, 4, success=1, item="完成")
+                    self.ui_call(self.set_status, f"已改用本地主檔，共 {len(master2)} 檔。")
+                    self.ui_call(messagebox.showinfo, "完成", f"全市場抓取失敗，已改用本地主檔\n共 {len(master2)} 檔\n\n使用主檔：{csv_path}")
+                    return
+                self.db.import_master_df(universe)
                 master2 = self.db.get_master()
-                self.ui_call(self._refresh_master_status_only)
+                self.ui_call(self.refresh_filters)
+                self.ui_call(self.refresh_all_tables)
+                self.ui_call(self.refresh_classification_summary_ui)
                 self.ui_call(self.update_task, "初始化全市場", 4, 4, success=1, item="完成")
                 self.ui_call(self.set_status, f"全市場初始化完成，共 {len(master2)} 檔。")
-                self.ui_call(messagebox.showinfo, "完成", f"全市場股票清單初始化完成\n共 {len(master2)} 檔\n\n注意：初始化只處理主檔/分類，不會觸發建庫、每日增量或重建排行。")
+                self.ui_call(messagebox.showinfo, "完成", f"全市場股票清單初始化完成\n共 {len(master2)} 檔")
             except Exception as e:
                 traceback.print_exc()
                 self.ui_call(messagebox.showerror, "錯誤", f"初始化失敗：\n{e}")
@@ -13839,13 +13224,17 @@ class AppUI:
                 pass
             return
 
-        trade = self.master_trading_engine.get_trade_pool(df)
-        self.populate_operation_sop(trade["market"], trade["trade_top20"], trade["today_buy"], trade["wait_pullback"], trade["attack"], trade["defense"])
-        attack_cnt = len(trade["attack"])
-        defense_cnt = len(trade["defense"])
-        self.set_status(
-            f"已載入資料，共 {len(df)} 檔｜市場 {trade['market']['regime']}｜主攻 {attack_cnt}｜防守 {defense_cnt}"
-        )
+        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
+        # refresh_all_tables 只負責刷新 TreeView / 類股 / 題材 / 儀表摘要。
+        # 停用多做段落：不得在 UI refresh 中呼叫 get_trade_pool，否則會觸發 EPS MATRIX DECISION / Teacher / trade_plan 重算。
+        # trade = self.master_trading_engine.get_trade_pool(df)
+        # self.populate_operation_sop(trade["market"], trade["trade_top20"], trade["today_buy"], trade["wait_pullback"], trade["attack"], trade["defense"])
+        # attack_cnt = len(trade["attack"])
+        # defense_cnt = len(trade["defense"])
+        # self.set_status(
+        #     f"已載入資料，共 {len(df)} 檔｜市場 {trade['market']['regime']}｜主攻 {attack_cnt}｜防守 {defense_cnt}"
+        # )
+        self.set_status(f"已載入資料，共 {len(df)} 檔｜已停用UI刷新內重型交易池重算。")
         if (self.last_top20_df is not None and not self.last_top20_df.empty) or (self.last_order_list_df is not None and not self.last_order_list_df.empty):
             self.refresh_top20_and_order_views()
         try:
@@ -13871,8 +13260,6 @@ class AppUI:
         def worker():
             workflow_state = {"success": 0, "failed": 0, "rows": 0, "cache_result": {}, "rank_count": 0}
             try:
-                if not self._workflow_required_or_abort("每日增量更新"):
-                    return
                 master = self.db.get_master()
                 total = len(master) if not master.empty else 1
                 counters = {"ok": 0, "fail": 0, "skip": 0}
@@ -13928,11 +13315,16 @@ class AppUI:
                     workflow_state["rank_count"] = rank_count
                     return pd.DataFrame([{"rank_count": rank_count}])
 
-                self.workflow_orchestrator.daily_update_master(
-                    update_price_history_fn=_update_price_history_fn,
-                    sync_external_tables_fn=_sync_external_tables_fn,
-                    rebuild_ranking_from_cache_fn=_rebuild_ranking_after_update_fn,
-                )
+                if self.workflow_orchestrator is not None:
+                    self.workflow_orchestrator.daily_update_master(
+                        update_price_history_fn=_update_price_history_fn,
+                        sync_external_tables_fn=_sync_external_tables_fn,
+                        rebuild_ranking_from_cache_fn=_rebuild_ranking_after_update_fn,
+                    )
+                else:
+                    _update_price_history_fn()
+                    _sync_external_tables_fn()
+                    _rebuild_ranking_after_update_fn()
 
                 success = int(workflow_state.get("success", 0) or 0)
                 failed = int(workflow_state.get("failed", 0) or 0)
@@ -13941,7 +13333,10 @@ class AppUI:
                 rank_count = int(workflow_state.get("rank_count", 0) or 0)
                 self.force_show_full_ranking_once = True
                 self.ui_call(self.refresh_filters, True)
-                self.ui_call(self._refresh_rank_result_only)
+                # [DISABLED_V13_MINIMAL_STOP_EXTRA]
+                # 每日增量完成後不再自動 refresh_all_tables，避免接續觸發 UI refresh 內重型 get_trade_pool / EPS DECISION / 圖表。
+                # 使用者需要畫面刷新時，可手動切換頁籤或執行快速重算排行。
+                # self.ui_call(self.refresh_all_tables, True)
                 self.ui_call(self.show_welcome_message)
                 self.ui_call(self.append_log, f"[WORKFLOW][Daily_Update_Master] END｜rows={rows}｜features={cache_result.get('feature_rows', 0)}｜ranking={rank_count}")
                 self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，基本面特徵 {cache_result.get('feature_rows', 0)} 筆，排行 {rank_count} 檔。")
@@ -13965,8 +13360,6 @@ class AppUI:
         """快速重算排行：只讀快取重算 ranking_result，禁止外部 API / EPS BUILD / financial_feature_daily 寫入。"""
         def worker():
             try:
-                if not self._workflow_required_or_abort("快速重算排行"):
-                    return
                 master = self.db.get_master()
                 total = len(master) if not master.empty else 1
                 self.ui_call(self.clear_log)
@@ -13996,15 +13389,24 @@ class AppUI:
                         teacher_mode="light",
                     )
 
-                result = self.workflow_orchestrator.fast_rank_rebuild(
-                    read_cache_fn=_read_cache_fn,
-                    rebuild_ranking_from_cache_fn=_rebuild_ranking_from_cache_fn,
-                    refresh_ui_fn=lambda *_args, **_kw: True,
-                )
-                count = int(result.get("ranking_df", 0) or 0) if isinstance(result, dict) else 0
+                if self.workflow_orchestrator is not None:
+                    result = self.workflow_orchestrator.fast_rank_rebuild(
+                        read_cache_fn=_read_cache_fn,
+                        rebuild_ranking_from_cache_fn=_rebuild_ranking_from_cache_fn,
+                        refresh_ui_fn=lambda *_args, **_kw: True,
+                    )
+                    count = int(result.get("ranking_df", 0) or 0) if isinstance(result, dict) else 0
+                else:
+                    _read_cache_fn()
+                    count = int(_rebuild_ranking_from_cache_fn() or 0)
 
                 self.force_show_full_ranking_once = True
-                self.ui_call(self._refresh_rank_result_only)
+                self.ui_call(self._reload_rank_tree_after_rebuild, True)
+                # [DISABLED_V13_MINIMAL_STOP_EXTRA]
+                # 快速重建排行完成後只重新載入排行 TreeView，不再呼叫 refresh_all_tables。
+                # refresh_all_tables 會連動 get_trade_pool / EPS MATRIX DECISION，造成重建排行完成後又卡住。
+                # self.ui_call(self.refresh_all_tables, True)
+                self.ui_call(self.refresh_classification_summary_ui)
                 self.ui_call(self.append_log, f"[WORKFLOW][FAST_RANK_REBUILD] END｜ranking={count}｜禁止EPS BUILD/外部API")
                 self.ui_call(self.finish_task, "快速重算排行", f"快速重算排行已完成，共 {count} 檔")
                 if count <= 0:
@@ -14289,10 +13691,14 @@ class AppUI:
 
     def show_top20(self):
         """AI選股TOP20：純讀取快照，不得觸發每日更新或重建排行。"""
+        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
+        # TOP20 顯示層禁止 auto_rebuild；只能讀取既有 ranking_result / teacher_snapshot。
         if not self.ensure_ranking_ready(auto_rebuild=False):
             return messagebox.showwarning("提醒", "目前尚無 AI TOP20 快照資料。請先執行『每日增量更新』，不要在 TOP20 顯示層自動重建。")
         self.clear_log()
         self.append_log(f"[WORKFLOW][AI_TOP20_VIEW] START｜BUILD_TAG={APP_BUILD_TAG}")
+        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
+        # 此區維持純快照讀取：不呼叫 update_daily / ranking_rebuild / get_trade_pool / EPS MATRIX BUILD。
         try:
             if self.workflow_orchestrator is not None:
                 self.workflow_orchestrator.ai_top20_view(
