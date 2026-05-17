@@ -13280,17 +13280,21 @@ class AppUI:
                 pass
             return
 
-        # [DISABLED_V13_MINIMAL_STOP_EXTRA]
-        # refresh_all_tables 只負責刷新 TreeView / 類股 / 題材 / 儀表摘要。
-        # 停用多做段落：不得在 UI refresh 中呼叫 get_trade_pool，否則會觸發 EPS MATRIX DECISION / Teacher / trade_plan 重算。
-        # trade = self.master_trading_engine.get_trade_pool(df)
-        # self.populate_operation_sop(trade["market"], trade["trade_top20"], trade["today_buy"], trade["wait_pullback"], trade["attack"], trade["defense"])
-        # attack_cnt = len(trade["attack"])
-        # defense_cnt = len(trade["defense"])
-        # self.set_status(
-        #     f"已載入資料，共 {len(df)} 檔｜市場 {trade['market']['regime']}｜主攻 {attack_cnt}｜防守 {defense_cnt}"
-        # )
-        self.set_status(f"已載入資料，共 {len(df)} 檔｜已停用UI刷新內重型交易池重算。")
+        # [RESTORE_MIS_DISABLED_0518][R08/R09]
+        # 不恢復 get_trade_pool 重算；只用既有快照/DB資料恢復操作SOP與交易儀表顯示。
+        # 保留 V13 對 build_history / update_daily / rebuild_rank / EPS MATRIX 的效能保護。
+        try:
+            self.populate_operation_sop(
+                market_engine.get_market_regime(),
+                getattr(self, "last_top20_df", pd.DataFrame()),
+                getattr(self, "last_today_buy_df", pd.DataFrame()),
+                getattr(self, "last_wait_df", pd.DataFrame()),
+                getattr(self, "last_attack_df", pd.DataFrame()),
+                getattr(self, "last_defense_df", pd.DataFrame()),
+            )
+        except Exception as exc:
+            log_warning(f"[RESTORE_MIS_DISABLED_0518] refresh_all_tables operation SOP skipped: {exc}")
+        self.set_status(f"已載入資料，共 {len(df)} 檔｜已恢復頁籤/儀表/SOP顯示；未觸發重型交易池重算。")
         if (self.last_top20_df is not None and not self.last_top20_df.empty) or (self.last_order_list_df is not None and not self.last_order_list_df.empty):
             self.refresh_top20_and_order_views()
         try:
@@ -13724,6 +13728,39 @@ class AppUI:
         self.cache_trade_dataframe(self.last_today_buy_df)
         self.cache_backtest_dataframe(self.last_top5_df)
         self.refresh_top20_and_order_views()
+
+        # [RESTORE_MIS_DISABLED_0518][R01/R05/R06/R07/R08]
+        # 只恢復原本「顯示層同步」：排行/交易儀表/產業輪/類股熱/題材輪/SOP 頁籤填表。
+        # 保留純快照讀取，不觸發每日更新、重建排行、EPS MATRIX、外部 API。
+        try:
+            self.refresh_all_tables(force_full_ranking=True, auto_rebuild=False, startup_light=False)
+        except Exception as exc:
+            log_warning(f"[RESTORE_MIS_DISABLED_0518] refresh_all_tables display sync skipped: {exc}")
+
+        try:
+            market = self.master_trading_engine.market_engine.get_market_regime()
+            self.populate_operation_sop(
+                market,
+                getattr(self, "last_top20_df", pd.DataFrame()),
+                getattr(self, "last_today_buy_df", pd.DataFrame()),
+                getattr(self, "last_wait_df", pd.DataFrame()),
+                getattr(self, "last_attack_df", pd.DataFrame()),
+                getattr(self, "last_defense_df", pd.DataFrame()),
+            )
+        except Exception as exc:
+            log_warning(f"[RESTORE_MIS_DISABLED_0518] operation SOP restore skipped: {exc}")
+
+        # [RESTORE_MIS_DISABLED_0518][R02/R03/R04]
+        # 快照顯示完成後，恢復原本預設選股與右側分析/圖表 callback。
+        # 這裡只觸發既有 sync_all_views，不新增分析邏輯。
+        try:
+            first_stock_id = str(df.iloc[0].get("stock_id", df.iloc[0].get("代號", ""))).strip()
+            if first_stock_id:
+                self.sync_multi_windows_selectors(first_stock_id)
+                self.sync_all_views(first_stock_id, source="強勢候選20")
+        except Exception as exc:
+            log_warning(f"[RESTORE_MIS_DISABLED_0518] default selection restore skipped: {exc}")
+
         self.left_notebook.select(self.tab_top20)
         self.open_three_windows()
         lines = [
