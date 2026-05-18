@@ -5868,6 +5868,27 @@ def attach_external_display_columns(x: pd.DataFrame) -> pd.DataFrame:
     if x is None or x.empty:
         return x
     out = x.copy()
+    # [RESTORE_ENGINE_SOURCE_0518][M02]
+    # 恢復 TOP20 來源欄位 lineage：candidate_engine/source_count/display_source。
+    # 僅做欄位保留與顯示修復，不重算、不改選股策略。
+    if "source_count" not in out.columns:
+        out["source_count"] = 1
+    out["source_count"] = pd.to_numeric(out["source_count"], errors="coerce").fillna(1).astype(int)
+    if "candidate_engine" not in out.columns:
+        out["candidate_engine"] = np.where(out["source_count"] >= 2, "雙引擎共振", "單引擎")
+    else:
+        _ce = pd.Series(out["candidate_engine"], index=out.index, copy=True).fillna("").astype(str).str.strip()
+        _placeholder = _ce.isin(["", "混合", "nan", "None", "<NA>"])
+        out.loc[_placeholder & out["source_count"].ge(2), "candidate_engine"] = "雙引擎共振"
+        out.loc[_placeholder & out["source_count"].lt(2), "candidate_engine"] = "單引擎"
+    if "display_source" not in out.columns:
+        out["display_source"] = out["candidate_engine"]
+    else:
+        _ds = pd.Series(out["display_source"], index=out.index, copy=True).fillna("").astype(str).str.strip()
+        _placeholder = _ds.isin(["", "混合", "nan", "None", "<NA>"])
+        out.loc[_placeholder, "display_source"] = out.loc[_placeholder, "candidate_engine"]
+    if "strategy_source" not in out.columns:
+        out["strategy_source"] = out["display_source"]
     mapping = {
         "外部允許": "trade_allowed",
         "外部Ready": "external_data_ready",
@@ -7082,7 +7103,7 @@ INSTITUTIONAL_TREE_SCHEMA = [
 
 CORE_ANALYSIS_COLUMNS = [
     "stock_id", "stock_name", "market", "industry", "theme", "is_etf",
-    "candidate_engine", "signal", "wave", "trade_type",
+    "candidate_engine", "source_count", "display_source", "strategy_source", "signal", "wave", "trade_type",
     "model_score", "wave_trade_score", "candidate20_score", "core_attack5_score", "execution_score",
     "mainstream_score", "breakout_score", "liquidity_score",
     "entry_low", "entry_high", "entry_mid", "price_deviation", "rr_live",
@@ -7732,6 +7753,10 @@ def ensure_trade_display_source_fields(df: pd.DataFrame) -> pd.DataFrame:
         "portfolio_state": pd.Series("未配置", index=idx, dtype="object"),
         "risk_note": pd.Series("", index=idx, dtype="object"),
         "priority": pd.Series(np.arange(1, len(x) + 1), index=idx, dtype="int64"),
+        "source_count": pd.Series(1, index=idx, dtype="int64"),
+        "candidate_engine": pd.Series("單引擎", index=idx, dtype="object"),
+        "display_source": pd.Series("單引擎", index=idx, dtype="object"),
+        "strategy_source": pd.Series("AI策略", index=idx, dtype="object"),
     }
     for col, val in defaults.items():
         if col not in x.columns:
@@ -7753,6 +7778,27 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
     for col, default in _teacher_strategy_default_payload().items():
         if col not in x.columns:
             x[col] = default
+
+    # [RESTORE_ENGINE_SOURCE_0518][M03]
+    # 顯示層恢復來源語義：不可把原本的「雙引擎共振」覆蓋成「混合」。
+    if "source_count" not in x.columns:
+        x["source_count"] = 1
+    x["source_count"] = pd.to_numeric(x["source_count"], errors="coerce").fillna(1).astype(int)
+    if "candidate_engine" not in x.columns:
+        x["candidate_engine"] = np.where(x["source_count"] >= 2, "雙引擎共振", "單引擎")
+    else:
+        _ce = pd.Series(x["candidate_engine"], index=x.index, copy=True).fillna("").astype(str).str.strip()
+        _placeholder = _ce.isin(["", "混合", "nan", "None", "<NA>"])
+        x.loc[_placeholder & x["source_count"].ge(2), "candidate_engine"] = "雙引擎共振"
+        x.loc[_placeholder & x["source_count"].lt(2), "candidate_engine"] = "單引擎"
+    if "display_source" not in x.columns:
+        x["display_source"] = x["candidate_engine"]
+    else:
+        _ds = pd.Series(x["display_source"], index=x.index, copy=True).fillna("").astype(str).str.strip()
+        _placeholder = _ds.isin(["", "混合", "nan", "None", "<NA>"])
+        x.loc[_placeholder, "display_source"] = x.loc[_placeholder, "candidate_engine"]
+    if "strategy_source" not in x.columns:
+        x["strategy_source"] = x["display_source"]
 
 
     def _log_missing_columns(*cols: str):
@@ -7870,6 +7916,7 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         ("兩高不過", "two_high_fail"), ("弱勢Gate", "weak_gate"), ("弱勢分數", "weak_score"), ("類股輪動", "rotation"),
         ("類股強度", "sector_strength_score"), ("資金流向分", "flow_score"), ("相對強弱RS", "rs_score"),
         ("老師買點", "teacher_buy_zone"), ("老師停損", "teacher_stop_loss"), ("老師目標", "teacher_target_price"), ("老師理由", "teacher_reason"),
+        ("來源引擎", "display_source"), ("來源引擎", "candidate_engine"), ("來源數", "source_count"),
         ("代號", "stock_id"), ("名稱", "stock_name"), ("優先級", "priority"), ("優先級", "優先級"),
     ]
     for zh, src in alias_pairs:
@@ -7909,7 +7956,7 @@ def build_display_columns(df: pd.DataFrame) -> pd.DataFrame:
         if pct_col in x.columns:
             x[pct_col] = pd.to_numeric(x[pct_col], errors="coerce").fillna(0.0).round(2)
 
-    for text_col, default in [("投資組合狀態", "未配置"), ("風險備註", ""), ("盤中狀態", ""), ("淘汰原因", ""), ("EPS Bucket", ""), ("Revenue Bucket", ""), ("EPS分類", "U0"), ("Matrix", ""), ("資料狀態", ""), ("EPS矩陣說明", ""), ("代號", ""), ("名稱", "")]:
+    for text_col, default in [("來源引擎", ""), ("display_source", ""), ("candidate_engine", ""), ("strategy_source", ""), ("投資組合狀態", "未配置"), ("風險備註", ""), ("盤中狀態", ""), ("淘汰原因", ""), ("EPS Bucket", ""), ("Revenue Bucket", ""), ("EPS分類", "U0"), ("Matrix", ""), ("資料狀態", ""), ("EPS矩陣說明", ""), ("代號", ""), ("名稱", "")]:
         if text_col in x.columns:
             x[text_col] = pd.Series(x[text_col], index=x.index, copy=True).fillna(default).astype(str)
     return x
@@ -9113,7 +9160,10 @@ class TradingPlanEngine:
             "trade_action": decision,
             "ui_state": ui_state,
             "tactical_light": tactical_light,
-            "candidate_engine": "混合",
+            "candidate_engine": "單引擎",
+            "source_count": 1,
+            "display_source": "單引擎",
+            "strategy_source": "AI策略",
             "entry_low": round(entry_low, 2),
             "entry_high": round(entry_high, 2),
             "entry_zone": f"{self._round_price(entry_low)} ~ {self._round_price(entry_high)}",
@@ -9316,6 +9366,8 @@ class MasterTradingEngine:
                 candidate_pool["stock_id"] = candidate_pool["stock_id"].astype(str).map(normalize_stock_id).astype(str).str.strip()
                 candidate_pool["source_count"] = candidate_pool.groupby("stock_id")["stock_id"].transform("count")
                 candidate_pool["candidate_engine"] = np.where(candidate_pool["source_count"] >= 2, "雙引擎共振", candidate_pool["candidate_engine"])
+                candidate_pool["display_source"] = candidate_pool["candidate_engine"]
+                candidate_pool["strategy_source"] = candidate_pool["candidate_engine"]
                 candidate_pool = candidate_pool.sort_values(["source_count", "mainstream_score", "breakout_score", "liquidity_score", "model_score"], ascending=False)
                 candidate_pool = candidate_pool.drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True)
 
@@ -12711,7 +12763,7 @@ class AppUI:
                 ui_action = str(r.get("ui_state", "不可買"))
                 light = self._get_display_light(r.to_dict())
                 self.top20_tree.insert("", "end", values=(
-                    i, r.get("stock_id", ""), r.get("stock_name", ""), self._display_light_symbol(light), r.get("candidate_engine", "混合"),
+                    i, r.get("stock_id", ""), r.get("stock_name", ""), self._display_light_symbol(light), r.get("display_source", r.get("candidate_engine", "")),
                     f"{float(r.get('現價', np.nan)):.2f}" if pd.notna(r.get("現價", np.nan)) else "-",
                     f"{float(r.get('漲跌', np.nan)):.2f}" if pd.notna(r.get("漲跌", np.nan)) else "-",
                     f"{float(r.get('漲跌幅%', np.nan)):.2f}" if pd.notna(r.get("漲跌幅%", np.nan)) else "-",
