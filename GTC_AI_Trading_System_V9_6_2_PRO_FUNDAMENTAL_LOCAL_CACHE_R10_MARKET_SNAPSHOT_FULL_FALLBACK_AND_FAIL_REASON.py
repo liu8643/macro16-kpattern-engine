@@ -13393,11 +13393,25 @@ class AppUI:
                 rank_count = int(workflow_state.get("rank_count", 0) or 0)
                 self.force_show_full_ranking_once = True
                 self.ui_call(self.refresh_filters, True)
-                # [DISABLED_V13_MINIMAL_STOP_EXTRA]
-                # 每日增量完成後不再自動 refresh_all_tables，避免接續觸發 UI refresh 內重型 get_trade_pool / EPS DECISION / 圖表。
-                # 使用者需要畫面刷新時，可手動切換頁籤或執行快速重算排行。
-                # self.ui_call(self.refresh_all_tables, True)
-                self.ui_call(self.show_welcome_message)
+                # [RESTORE_MIS_DISABLED_0518][P0-DAILY-UI-RESTORE]
+                # 每日增量更新完成後，只恢復「原本的顯示/連動」：
+                # 1) 從最新 ranking_result 讀 TOP20 快照，建立 last_* 顯示快取
+                # 2) 呼叫既有 _render_top20_snapshot_view()，由它接回 refresh_all_tables / 頁籤 / 右側第一筆分析 / 圖表
+                # 3) 不觸發 build_history、外部 API、EPS MATRIX BUILD、Teacher full merge
+                # 原本這裡被改成 show_welcome_message，導致每日更新完成後畫面停在空白/未指定個股。
+                display_top20_df = pd.DataFrame()
+                try:
+                    display_top20_df = self._read_top20_snapshot_for_view(20)
+                except Exception as exc:
+                    log_warning(f"[RESTORE_MIS_DISABLED_0518] daily display snapshot read skipped: {exc}")
+                if display_top20_df is not None and not display_top20_df.empty:
+                    first_stock_id = str(display_top20_df.iloc[0].get("stock_id", display_top20_df.iloc[0].get("代號", ""))).strip()
+                    self.ui_call(self._render_top20_snapshot_view, display_top20_df)
+                    self.ui_call(self.append_log, f"[DISPLAY_REFRESH_FROM_RANKING] rows={rank_count}｜TOP20 loaded={len(display_top20_df)}｜sync_first_stock={first_stock_id}")
+                else:
+                    # 若 DB 快照讀取失敗，才回退到既有全表顯示刷新；不再呼叫 show_welcome_message 覆蓋畫面。
+                    self.ui_call(self.refresh_all_tables, True, False, False)
+                    self.ui_call(self.append_log, "[DISPLAY_REFRESH_FROM_RANKING][WARN] TOP20 snapshot empty; fallback refresh_all_tables only")
                 self.ui_call(self.append_log, f"[WORKFLOW][Daily_Update_Master] END｜rows={rows}｜features={cache_result.get('feature_rows', 0)}｜ranking={rank_count}")
                 self.ui_call(self.finish_task, "每日增量更新", f"完成：成功 {success} 檔，寫入 {rows} 筆，基本面特徵 {cache_result.get('feature_rows', 0)} 筆，排行 {rank_count} 檔。")
                 self.ui_call(messagebox.showinfo, "完成", f"每日增量更新完成\n成功 {success} 檔\n寫入 {rows} 筆\n基本面特徵 {cache_result.get('feature_rows', 0)} 筆\n排行 {rank_count} 檔\n（行情 + EPS/估值 + 月營收已先寫入本地DB）")
@@ -13461,11 +13475,20 @@ class AppUI:
                     count = int(_rebuild_ranking_from_cache_fn() or 0)
 
                 self.force_show_full_ranking_once = True
-                self.ui_call(self._reload_rank_tree_after_rebuild, True)
-                # [DISABLED_V13_MINIMAL_STOP_EXTRA]
-                # 快速重建排行完成後只重新載入排行 TreeView，不再呼叫 refresh_all_tables。
-                # refresh_all_tables 會連動 get_trade_pool / EPS MATRIX DECISION，造成重建排行完成後又卡住。
-                # self.ui_call(self.refresh_all_tables, True)
+                # [RESTORE_MIS_DISABLED_0518][P1-FAST-UI-RESTORE]
+                # 快速重建排行完成後，恢復純顯示刷新與第一筆連動；不恢復重型資料流程。
+                display_top20_df = pd.DataFrame()
+                try:
+                    display_top20_df = self._read_top20_snapshot_for_view(20)
+                except Exception as exc:
+                    log_warning(f"[RESTORE_MIS_DISABLED_0518] fast display snapshot read skipped: {exc}")
+                if display_top20_df is not None and not display_top20_df.empty:
+                    first_stock_id = str(display_top20_df.iloc[0].get("stock_id", display_top20_df.iloc[0].get("代號", ""))).strip()
+                    self.ui_call(self._render_top20_snapshot_view, display_top20_df)
+                    self.ui_call(self.append_log, f"[DISPLAY_REFRESH_FROM_RANKING][FAST] rows={count}｜TOP20 loaded={len(display_top20_df)}｜sync_first_stock={first_stock_id}")
+                else:
+                    self.ui_call(self.refresh_all_tables, True, False, False)
+                    self.ui_call(self.append_log, "[DISPLAY_REFRESH_FROM_RANKING][FAST][WARN] TOP20 snapshot empty; fallback refresh_all_tables only")
                 self.ui_call(self.refresh_classification_summary_ui)
                 self.ui_call(self.append_log, f"[WORKFLOW][FAST_RANK_REBUILD] END｜ranking={count}｜禁止EPS BUILD/外部API")
                 self.ui_call(self.finish_task, "快速重算排行", f"快速重算排行已完成，共 {count} 檔")
