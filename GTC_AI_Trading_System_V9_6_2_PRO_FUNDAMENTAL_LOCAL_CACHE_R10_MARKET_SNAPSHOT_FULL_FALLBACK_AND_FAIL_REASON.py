@@ -13736,10 +13736,217 @@ class AppUI:
             log_warning(f"[AI TOP20][SNAPSHOT LOAD][WARN] {exc}")
             return False
 
+
+    def _normalize_cached_top20_source_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """[FIX6_CACHE_DUAL_POOL_RESTORE]
+        快取層欄位標準化：只使用既有 ranking/snapshot/trade_plan 欄位，不呼叫 get_trade_pool、不重建排行。
+        """
+        if df is None or df.empty:
+            return pd.DataFrame()
+        x = df.copy()
+        if "stock_id" not in x.columns and "代號" in x.columns:
+            x["stock_id"] = x["代號"]
+        if "stock_name" not in x.columns and "名稱" in x.columns:
+            x["stock_name"] = x["名稱"]
+        if "close" not in x.columns and "現價" in x.columns:
+            x["close"] = x["現價"]
+        if "stock_id" not in x.columns:
+            return pd.DataFrame()
+        x["stock_id"] = x["stock_id"].astype(str).map(normalize_stock_id).astype(str).str.strip()
+        x = x[x["stock_id"].ne("")].copy()
+        if x.empty:
+            return pd.DataFrame()
+
+        def _ensure_num(col, default=0.0, aliases=None):
+            aliases = aliases or []
+            if col in x.columns:
+                s = pd.to_numeric(x[col], errors="coerce")
+            else:
+                s = pd.Series(np.nan, index=x.index)
+                for a in aliases:
+                    if a in x.columns:
+                        s = pd.to_numeric(x[a], errors="coerce")
+                        break
+            x[col] = s.fillna(default)
+
+        _ensure_num("total_score", 0.0, ["candidate20_score", "model_score", "ai_score"])
+        _ensure_num("ai_score", 0.0, ["total_score"])
+        _ensure_num("model_score", 0.0, ["total_score", "ai_score"])
+        _ensure_num("wave_trade_score", 0.0, ["trade_score", "technical_total_score", "total_score"])
+        _ensure_num("trade_score", 0.0, ["wave_trade_score", "technical_total_score", "total_score"])
+        _ensure_num("liquidity_score", 0.0, ["volume_score"])
+        _ensure_num("volume_score", 0.0, ["liquidity_score"])
+        _ensure_num("leader_follow_score", 0.0, ["ai_score"])
+        _ensure_num("intraday_trend_score", 0.0, ["trend_score"])
+        _ensure_num("win_rate", 0.0, ["risk_score"])
+        _ensure_num("rr", 0.0, ["rr_live"])
+        _ensure_num("rr_live", 0.0, ["rr"])
+        _ensure_num("attack_volume_score", 0.0, ["volume_score"])
+        _ensure_num("range_breakout_score", 0.0, ["reversal_score"])
+        _ensure_num("active_buy_score", 0.0, ["momentum_score"])
+        _ensure_num("orderflow_aggression_score", 0.0, ["volume_score"])
+        _ensure_num("mainstream_score", np.nan)
+        _ensure_num("breakout_score", np.nan)
+        _ensure_num("modules_pass_count", np.nan)
+
+        if x["modules_pass_count"].isna().all():
+            pass_cols = [c for c in ["trend_ok", "kd_ok", "macd_ok", "volume_ok"] if c in x.columns]
+            if pass_cols:
+                x["modules_pass_count"] = x[pass_cols].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
+            else:
+                # 快取層無四模組布林欄位時，以趨勢/量能/AI分數代理，不做重算。
+                x["modules_pass_count"] = (
+                    (pd.to_numeric(x["trend_score"], errors="coerce").fillna(0) >= 60).astype(int) if "trend_score" in x.columns else 0
+                ) + (
+                    (pd.to_numeric(x["volume_score"], errors="coerce").fillna(0) >= 60).astype(int) if "volume_score" in x.columns else 0
+                ) + (
+                    (pd.to_numeric(x["ai_score"], errors="coerce").fillna(0) >= 60).astype(int) if "ai_score" in x.columns else 0
+                )
+
+        mainstream_calc = (
+            pd.to_numeric(x["model_score"], errors="coerce").fillna(0) * 0.30 +
+            pd.to_numeric(x["liquidity_score"], errors="coerce").fillna(0) * 0.22 +
+            pd.to_numeric(x["leader_follow_score"], errors="coerce").fillna(0) * 0.18 +
+            pd.to_numeric(x["intraday_trend_score"], errors="coerce").fillna(0) * 0.10 +
+            pd.to_numeric(x["win_rate"], errors="coerce").fillna(0) * 0.12 +
+            pd.to_numeric(x["rr"], errors="coerce").fillna(0).clip(upper=3) * 5
+        ).round(2)
+        breakout_calc = (
+            pd.to_numeric(x["wave_trade_score"], errors="coerce").fillna(0) * 0.28 +
+            pd.to_numeric(x["attack_volume_score"], errors="coerce").fillna(0) * 0.20 +
+            pd.to_numeric(x["range_breakout_score"], errors="coerce").fillna(0) * 0.18 +
+            pd.to_numeric(x["active_buy_score"], errors="coerce").fillna(0) * 0.12 +
+            pd.to_numeric(x["model_score"], errors="coerce").fillna(0) * 0.10 +
+            pd.to_numeric(x["rr"], errors="coerce").fillna(0).clip(upper=3) * 5
+        ).round(2)
+        x.loc[pd.to_numeric(x["mainstream_score"], errors="coerce").isna(), "mainstream_score"] = mainstream_calc
+        x.loc[pd.to_numeric(x["breakout_score"], errors="coerce").isna(), "breakout_score"] = breakout_calc
+        x["mainstream_score"] = pd.to_numeric(x["mainstream_score"], errors="coerce").fillna(mainstream_calc)
+        x["breakout_score"] = pd.to_numeric(x["breakout_score"], errors="coerce").fillna(breakout_calc)
+        x["modules_pass_count"] = pd.to_numeric(x["modules_pass_count"], errors="coerce").fillna(0)
+
+        if "candidate20_score" not in x.columns:
+            cw = SCORE_FORMULA_WEIGHTS.get("candidate20", {})
+            x["candidate20_score"] = (
+                pd.to_numeric(x["model_score"], errors="coerce").fillna(0) * float(cw.get("model_score", 0.18)) +
+                pd.to_numeric(x["wave_trade_score"], errors="coerce").fillna(0) * float(cw.get("wave_trade_score", 0.16)) +
+                pd.to_numeric(x["liquidity_score"], errors="coerce").fillna(0) * float(cw.get("liquidity_score", 0.12)) +
+                pd.to_numeric(x["mainstream_score"], errors="coerce").fillna(0) * float(cw.get("mainstream_score", 0.12)) +
+                pd.to_numeric(x["breakout_score"], errors="coerce").fillna(0) * float(cw.get("breakout_score", 0.12)) +
+                pd.to_numeric(x["leader_follow_score"], errors="coerce").fillna(0) * float(cw.get("leader_follow_score", 0.08)) +
+                pd.to_numeric(x["active_buy_score"], errors="coerce").fillna(0) * float(cw.get("active_buy_score", 0.06)) +
+                pd.to_numeric(x["orderflow_aggression_score"], errors="coerce").fillna(0) * float(cw.get("orderflow_aggression_score", 0.06)) +
+                pd.to_numeric(x["win_rate"], errors="coerce").fillna(0) * float(cw.get("win_rate", 0.04)) +
+                pd.to_numeric(x["rr"], errors="coerce").fillna(0).clip(upper=3) * float(cw.get("rr_factor", 4)) +
+                pd.to_numeric(x["modules_pass_count"], errors="coerce").fillna(0) * float(cw.get("modules_pass_count", 2))
+            ).round(2)
+        return x
+
+    def _finalize_cached_dual_engine_pool(self, candidate_pool: pd.DataFrame, top_n: int = 20, source_label: str = "cache") -> pd.DataFrame:
+        """[FIX6_CACHE_DUAL_POOL_RESTORE] 共通收斂：source_count → candidate_engine → display_source → 排序去重。"""
+        if candidate_pool is None or candidate_pool.empty:
+            return pd.DataFrame()
+        x = candidate_pool.copy()
+        x["stock_id"] = x["stock_id"].astype(str).map(normalize_stock_id).astype(str).str.strip()
+        x = x[x["stock_id"].ne("")].copy()
+        if x.empty:
+            return pd.DataFrame()
+        x["source_count"] = x.groupby("stock_id")["stock_id"].transform("count").astype(int)
+        if "candidate_engine" not in x.columns:
+            x["candidate_engine"] = "主流TOP20"
+        x["candidate_engine"] = x["candidate_engine"].fillna("").astype(str).str.strip()
+        x["candidate_engine"] = np.where(x["source_count"].ge(2), "雙引擎共振", x["candidate_engine"])
+        x.loc[x["candidate_engine"].isin(["", "混合", "單引擎", "nan", "None", "<NA>"]), "candidate_engine"] = "主流TOP20"
+        x["display_source"] = x["candidate_engine"]
+        x["strategy_source"] = x["candidate_engine"]
+        sort_cols = [c for c in ["source_count", "candidate20_score", "mainstream_score", "breakout_score", "liquidity_score", "model_score", "total_score"] if c in x.columns]
+        if sort_cols:
+            x = x.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+        x = x.drop_duplicates(subset=["stock_id"], keep="first").reset_index(drop=True).head(int(top_n or 20)).copy()
+        x["pool_role"] = "強勢候選20"
+        if "source_rank" not in x.columns:
+            x["source_rank"] = "candidate20"
+        resonance_count = int(pd.to_numeric(x.get("source_count", pd.Series(dtype=int)), errors="coerce").fillna(0).ge(2).sum())
+        log_info(f"[CACHE-POOL-FINAL] source={source_label}｜trade_top20={len(x)}｜resonance_count={resonance_count}")
+        return x
+
+    def _build_cached_dual_engine_candidate_pool(self, source_df: pd.DataFrame, top_n: int = 20, source_label: str = "ranking_result") -> pd.DataFrame:
+        """[FIX6_CACHE_DUAL_POOL_RESTORE]
+        恢復 TOP20 雙引擎「池化組合邏輯」，但只使用快取資料。
+        禁止：get_trade_pool / build_plan / ranking_rebuild / update_daily / EPS_MATRIX_BUILD / 外部 API。
+        正確流程：cache_mainstream_top20 + cache_breakout_top20 → candidate_pool → source_count → 雙引擎共振。
+        """
+        x = self._normalize_cached_top20_source_columns(source_df)
+        if x is None or x.empty:
+            return pd.DataFrame()
+        mainstream_top20 = x.sort_values(
+            [c for c in ["mainstream_score", "modules_pass_count", "liquidity_score", "model_score", "total_score"] if c in x.columns],
+            ascending=False
+        ).head(20).copy()
+        breakout_top20 = x.sort_values(
+            [c for c in ["breakout_score", "modules_pass_count", "attack_volume_score", "trade_score", "total_score"] if c in x.columns],
+            ascending=False
+        ).head(20).copy()
+
+        combined_parts = []
+        if mainstream_top20 is not None and not mainstream_top20.empty:
+            tmp = mainstream_top20.copy()
+            tmp["candidate_engine"] = "主流TOP20"
+            combined_parts.append(tmp)
+        if breakout_top20 is not None and not breakout_top20.empty:
+            tmp = breakout_top20.copy()
+            tmp["candidate_engine"] = "起爆TOP20"
+            combined_parts.append(tmp)
+        if not combined_parts:
+            return pd.DataFrame()
+        candidate_pool = pd.concat(combined_parts, ignore_index=True)
+        resonance_raw = int(candidate_pool.duplicated(subset=["stock_id"], keep=False).sum())
+        log_info(
+            f"[CACHE-POOL-STAGE] source={source_label}｜mainstream={len(mainstream_top20)}｜"
+            f"breakout={len(breakout_top20)}｜candidate_raw={len(candidate_pool)}｜resonance_raw_rows={resonance_raw}"
+        )
+        return self._finalize_cached_dual_engine_pool(candidate_pool, top_n=top_n, source_label=source_label)
+
+    def _normalize_existing_candidate_source_fields(self, df: pd.DataFrame, top_n: int = 20, source_label: str = "snapshot") -> pd.DataFrame:
+        """[FIX6_CACHE_DUAL_POOL_RESTORE] 對已經帶有 source_count/candidate_engine 的舊快照做欄位收斂。"""
+        if df is None or df.empty:
+            return pd.DataFrame()
+        x = df.copy()
+        if "stock_id" not in x.columns and "代號" in x.columns:
+            x["stock_id"] = x["代號"]
+        if "stock_id" not in x.columns:
+            return pd.DataFrame()
+        x["stock_id"] = x["stock_id"].astype(str).map(normalize_stock_id).astype(str).str.strip()
+        x = x[x["stock_id"].ne("")].copy()
+        if "source_count" not in x.columns:
+            x["source_count"] = 1
+        x["source_count"] = pd.to_numeric(x["source_count"], errors="coerce").fillna(1).astype(int)
+        if "candidate_engine" not in x.columns:
+            x["candidate_engine"] = np.where(x["source_count"].ge(2), "雙引擎共振", "主流TOP20")
+        else:
+            ce = pd.Series(x["candidate_engine"], index=x.index, copy=True).fillna("").astype(str).str.strip()
+            bad = ce.isin(["", "混合", "單引擎", "nan", "None", "<NA>"])
+            x.loc[bad & x["source_count"].ge(2), "candidate_engine"] = "雙引擎共振"
+            x.loc[bad & x["source_count"].lt(2), "candidate_engine"] = "主流TOP20"
+        x["display_source"] = x["candidate_engine"]
+        x["strategy_source"] = x["candidate_engine"]
+        if "pool_role" not in x.columns:
+            x["pool_role"] = "強勢候選20"
+        if "source_rank" not in x.columns:
+            x["source_rank"] = "candidate20"
+        sort_cols = [c for c in ["source_count", "candidate20_score", "mainstream_score", "breakout_score", "liquidity_score", "model_score", "total_score"] if c in x.columns]
+        if sort_cols:
+            x = x.sort_values(sort_cols, ascending=[False] * len(sort_cols))
+        x = x.drop_duplicates(subset=["stock_id"], keep="first").head(int(top_n or 20)).copy()
+        log_info(f"[CACHE-POOL-FINAL] source={source_label}｜existing_candidate_rows={len(x)}")
+        return x
+
+
     def _read_latest_ai_top20_snapshot_df(self, top_n: int = 20):
-        """[FIX5_RESTORE_TOP20_SOURCE_CACHE_ONLY]
-        只讀既有 ai_top20_snapshot_json，恢復原始 TOP20 的 candidate_engine/source_count/display_source。
-        禁止呼叫 get_trade_pool / ranking_rebuild / update_daily；若沒有快照，回傳空表讓後段走 ranking_result fallback。
+        """[FIX6_CACHE_DUAL_POOL_RESTORE]
+        只讀既有 ai_top20_snapshot_json；優先使用已保存的正確 candidate_pool。
+        若快照內只剩單一路徑/全部主流，回傳空表，交由 ranking_result 快取層重建雙引擎 candidate_pool。
+        禁止呼叫 get_trade_pool / ranking_rebuild / update_daily。
         """
         try:
             self._ensure_ai_top20_snapshot_table()
@@ -13756,35 +13963,30 @@ class AppUI:
                 return pd.DataFrame()
             payload_json, created_at, row_count = row
             payload = json.loads(payload_json or "{}")
-            # 原始雙引擎來源欄位在 last_candidate_top20_df / last_top20_df 內，不在 ranking_result 內。
-            df = self._snapshot_json_to_df(payload.get("last_candidate_top20_df", ""))
-            if df is None or df.empty:
-                df = self._snapshot_json_to_df(payload.get("last_top20_df", ""))
-            if df is None or df.empty:
-                return pd.DataFrame()
-            x = df.copy().head(int(top_n or 20))
-            if "stock_id" in x.columns:
-                x["stock_id"] = x["stock_id"].astype(str).map(normalize_stock_id).astype(str).str.strip()
-            if "source_count" not in x.columns:
-                x["source_count"] = 1
-            x["source_count"] = pd.to_numeric(x["source_count"], errors="coerce").fillna(1).astype(int)
-            if "candidate_engine" not in x.columns:
-                x["candidate_engine"] = np.where(x["source_count"].ge(2), "雙引擎共振", "主流TOP20")
-            else:
-                ce = pd.Series(x["candidate_engine"], index=x.index, copy=True).fillna("").astype(str).str.strip()
-                bad = ce.isin(["", "混合", "單引擎", "nan", "None", "<NA>"])
-                x.loc[bad & x["source_count"].ge(2), "candidate_engine"] = "雙引擎共振"
-                x.loc[bad & x["source_count"].lt(2), "candidate_engine"] = "主流TOP20"
-            if "display_source" not in x.columns:
-                x["display_source"] = x["candidate_engine"]
-            else:
-                ds = pd.Series(x["display_source"], index=x.index, copy=True).fillna("").astype(str).str.strip()
-                bad = ds.isin(["", "混合", "單引擎", "nan", "None", "<NA>"])
-                x.loc[bad, "display_source"] = x.loc[bad, "candidate_engine"]
-            if "strategy_source" not in x.columns:
-                x["strategy_source"] = x["display_source"]
-            log_info(f"[AI_TOP20_VIEW][CACHE_SOURCE_RESTORE] ai_top20_snapshot_json loaded rows={len(x)} created_at={created_at} source=last_candidate_top20_df/last_top20_df")
-            return x
+
+            # 1) 正常舊快照：last_candidate_top20_df 已含 source_count/candidate_engine。
+            candidate_df = self._snapshot_json_to_df(payload.get("last_candidate_top20_df", ""))
+            if candidate_df is not None and not candidate_df.empty:
+                normalized = self._normalize_existing_candidate_source_fields(candidate_df, top_n=top_n, source_label="ai_top20_snapshot_json:last_candidate_top20_df")
+                if normalized is not None and not normalized.empty:
+                    has_dual = (
+                        ("source_count" in normalized.columns and pd.to_numeric(normalized["source_count"], errors="coerce").fillna(1).ge(2).any()) or
+                        ("candidate_engine" in normalized.columns and normalized["candidate_engine"].astype(str).str.contains("雙引擎|起爆", na=False).any())
+                    )
+                    if has_dual:
+                        log_info(f"[AI_TOP20_VIEW][CACHE_SOURCE_RESTORE] use existing candidate_pool rows={len(normalized)} created_at={created_at}")
+                        return normalized
+                    log_warning("[AI_TOP20_VIEW][CACHE_SOURCE_RESTORE] snapshot candidate_pool has no dual-engine evidence; fallback to cache rebuild")
+
+            # 2) 若快照保存的是較大的 raw/ranking 結果，使用快取層池化，不重算。
+            for key in ["last_top20_df", "last_watch_df", "last_unique_decision_df"]:
+                raw_df = self._snapshot_json_to_df(payload.get(key, ""))
+                if raw_df is not None and not raw_df.empty and len(raw_df) >= int(top_n or 20):
+                    rebuilt = self._build_cached_dual_engine_candidate_pool(raw_df, top_n=top_n, source_label=f"ai_top20_snapshot_json:{key}")
+                    if rebuilt is not None and not rebuilt.empty:
+                        log_info(f"[AI_TOP20_VIEW][CACHE_POOL_REBUILD] source={key} rows={len(rebuilt)} created_at={created_at}")
+                        return rebuilt
+            return pd.DataFrame()
         except Exception as exc:
             log_warning(f"[AI_TOP20_VIEW][CACHE_SOURCE_RESTORE][WARN] {exc}")
             return pd.DataFrame()
@@ -13830,34 +14032,36 @@ class AppUI:
             return df
 
     def _read_top20_snapshot_for_view(self, top_n: int = 20, **_kwargs):
-        """AI TOP20 純讀快照：優先讀 ai_top20_snapshot_json，fallback 才讀 ranking_result / teacher_strategy_snapshot；不觸發任何重算。"""
+        """[FIX6_CACHE_DUAL_POOL_RESTORE]
+        AI TOP20 純讀取快取；先讀正確快照，沒有正確快照時用 ranking_result 快取層重建雙引擎池。
+        不觸發任何重流程：get_trade_pool / ranking_rebuild / update_daily / EPS MATRIX / 外部 API 全部禁止。
+        """
         cached = self._read_latest_ai_top20_snapshot_df(top_n=top_n)
         if cached is not None and not cached.empty:
-            try:
-                cached = self.enrich_price_and_export_fields(cached, id_col="stock_id")
-            except Exception as exc:
-                log_warning(f"[AI_TOP20_VIEW] cached snapshot enrich skipped: {exc}")
-            return cached
-        ranking = self.db.get_latest_ranking()
-        if ranking is None or ranking.empty:
-            return pd.DataFrame()
-        x = ranking.copy()
-        if "rank_all" in x.columns:
-            x = x.sort_values(["rank_all"]).reset_index(drop=True)
+            x = cached.copy()
         else:
-            x = x.sort_values(["total_score"], ascending=False).reset_index(drop=True)
-        x = x.head(int(top_n or 20)).copy()
-        # [FIX5_RESTORE_TOP20_SOURCE_CACHE_ONLY] fallback 情境只讀 trade_plan 最新批次補 pool_role/source_rank；不重算、不假造雙引擎。
-        x = self._merge_latest_trade_plan_source_fields(x)
-        if "source_count" not in x.columns:
-            x["source_count"] = 1
-        x["source_count"] = pd.to_numeric(x["source_count"], errors="coerce").fillna(1).astype(int)
-        if "candidate_engine" not in x.columns:
-            x["candidate_engine"] = np.where(x["source_count"].ge(2), "雙引擎共振", "主流TOP20")
-        if "display_source" not in x.columns:
-            x["display_source"] = x["candidate_engine"]
-        if "strategy_source" not in x.columns:
-            x["strategy_source"] = x["display_source"]
+            ranking = self.db.get_latest_ranking()
+            if ranking is None or ranking.empty:
+                return pd.DataFrame()
+            # [FIX6] 不能再直接 ranking_result 前20；必須從完整快取排行重建兩池。
+            x = self._build_cached_dual_engine_candidate_pool(ranking, top_n=top_n, source_label="ranking_result_cache")
+            if x is None or x.empty:
+                return pd.DataFrame()
+            # 僅補 trade_plan 池角色/決策欄位；不得覆蓋 candidate_engine/source_count/display_source。
+            try:
+                before_engine = x[["stock_id", "candidate_engine", "source_count", "display_source"]].copy()
+                merged = self._merge_latest_trade_plan_source_fields(x)
+                if merged is not None and not merged.empty:
+                    x = merged
+                    for col in ["candidate_engine", "source_count", "display_source", "strategy_source"]:
+                        if col in before_engine.columns:
+                            x = x.drop(columns=[col], errors="ignore")
+                    x = x.merge(before_engine, on="stock_id", how="left")
+                    if "strategy_source" not in x.columns:
+                        x["strategy_source"] = x["display_source"]
+            except Exception as exc:
+                log_warning(f"[AI_TOP20_VIEW] trade_plan auxiliary merge skipped: {exc}")
+
         try:
             teacher = self.db.get_latest_teacher_strategy_snapshot()
             if teacher is not None and not teacher.empty and "stock_id" in teacher.columns:
@@ -13875,11 +14079,32 @@ class AppUI:
                 x = finalize_teacher_strategy_fields(x)
         except Exception as exc:
             log_warning(f"[AI_TOP20_VIEW] teacher snapshot merge skipped: {exc}")
+
+        # 再次鎖住雙引擎來源欄位，防止 teacher/enrich 顯示層覆蓋。
+        if "source_count" not in x.columns:
+            x["source_count"] = 1
+        x["source_count"] = pd.to_numeric(x["source_count"], errors="coerce").fillna(1).astype(int)
+        if "candidate_engine" not in x.columns:
+            x["candidate_engine"] = np.where(x["source_count"].ge(2), "雙引擎共振", "主流TOP20")
+        x["candidate_engine"] = x["candidate_engine"].fillna("").astype(str).str.strip()
+        x.loc[x["candidate_engine"].isin(["", "混合", "單引擎", "nan", "None", "<NA>"]) & x["source_count"].ge(2), "candidate_engine"] = "雙引擎共振"
+        x.loc[x["candidate_engine"].isin(["", "混合", "單引擎", "nan", "None", "<NA>"]) & x["source_count"].lt(2), "candidate_engine"] = "主流TOP20"
+        x["display_source"] = x["candidate_engine"]
+        x["strategy_source"] = x["candidate_engine"]
+
         try:
             x = self.enrich_price_and_export_fields(x, id_col="stock_id")
+            # enrich 後再保護一次來源欄位。
+            x["source_count"] = pd.to_numeric(x["source_count"], errors="coerce").fillna(1).astype(int)
+            x["candidate_engine"] = x["candidate_engine"].fillna("").astype(str).str.strip()
+            x["display_source"] = x["candidate_engine"]
+            x["strategy_source"] = x["candidate_engine"]
         except Exception as exc:
             log_warning(f"[AI_TOP20_VIEW] enrich display fields skipped: {exc}")
-        return x
+
+        resonance_count = int(pd.to_numeric(x.get("source_count", pd.Series(dtype=int)), errors="coerce").fillna(0).ge(2).sum())
+        log_info(f"[CACHE-POOL-AUDIT] top20={len(x)}｜resonance_count={resonance_count}｜candidate_engine={x.get('candidate_engine', pd.Series(dtype=str)).astype(str).value_counts().to_dict()}")
+        return x.head(int(top_n or 20)).copy()
 
     def _render_top20_snapshot_view(self, top20_df, **_kwargs):
         if top20_df is None or top20_df.empty:
